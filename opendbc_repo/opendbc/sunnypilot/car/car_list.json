@@ -989,6 +989,16 @@
     ],
     "package": "Honda Sensing"
   },
+  "Honda Odyssey 2005": {
+    "platform": "HONDA_ODYSSEY_2005",
+    "make": "Honda",
+    "brand": "honda",
+    "model": "Odyssey",
+    "year": [
+      "2005"
+    ],
+    "package": "Custom"
+  },
   "Honda Passport 2019-25": {
     "platform": "HONDA_PILOT",
     "make": "Honda",
