@@ -8,6 +8,7 @@
 // include the safety policies.
 #include "safety/safety_defaults.h"
 #include "safety/safety_honda.h"
+#include "safety/safety_odyssey.h"
 #include "safety/safety_toyota.h"
 #include "safety/safety_tesla.h"
 #include "safety/safety_gm.h"
@@ -415,6 +416,7 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
     {SAFETY_BODY, &body_hooks},
     {SAFETY_FORD, &ford_hooks},
     {SAFETY_RIVIAN, &rivian_hooks},
+    {SAFETY_HONDA_ODYSSEY, &honda_odyssey_hooks},
 #ifdef CANFD
     {SAFETY_HYUNDAI_CANFD, &hyundai_canfd_hooks},
 #endif

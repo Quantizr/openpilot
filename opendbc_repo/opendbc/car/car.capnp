@@ -637,6 +637,7 @@ struct CarParams {
     fcaGiorgio @32;
     rivian @33;
     volkswagenMeb @34;
+    hondaOdyssey @35;
   }
 
   enum SteerControlType {
