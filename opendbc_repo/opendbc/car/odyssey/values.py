@@ -4,7 +4,6 @@ from enum import Enum, IntFlag
 from opendbc.car import Bus, DbcDict, CarSpecs, PlatformConfig, Platforms, structs, uds
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.docs_definitions import CarFootnote, CarHarness, CarDocs, CarParts, Column, Device
-from opendbc.car.fw_query_definitions import FwQueryConfig, Request, StdQueries, p16f
 
 Ecu = structs.CarParams.Ecu
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
