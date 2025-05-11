@@ -251,7 +251,7 @@ class CarController(CarControllerBase, MadsCarController):
                                             CarControllerParams.STEER_DELTA_UP, CarControllerParams.STEER_DELTA_DOWN,
                                             CarControllerParams.STEER_ERROR_MAX, CarControllerParams.STEER_MAX)
         can_sends.append(hondacan.create_steer_command(self.frame, hondacan.SteeringModes.TorqueControl, apply_steer))
-      elif not CS.cruise_stalk_cancel and not CS.out.brakePressed and not CS.out.gasPressed and self.apply_steer_last != 0:
+      elif not CS.out.brakePressed and not CS.out.gasPressed and self.apply_steer_last != 0:
         can_sends.append(hondacan.create_steer_command(self.frame, hondacan.SteeringModes.SoftOff, self.apply_steer_last))
         apply_steer = CS.out.steeringTorqueEps
       else:
