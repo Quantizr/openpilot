@@ -125,13 +125,12 @@ class HondaCarDocs(CarDocs):
 #   def init(self):
 #     self.flags |= HondaFlags.NIDEC
 
-
+@dataclass
 class HondaOdysseyStepperServoConfig(PlatformConfig):
   dbc_dict: DbcDict = field(default_factory=lambda: {
     Bus.pt: 'honda_odyssey_2005',
     # Bus.radar: RADAR.DELPHI_MRR,
   })
-
   def init(self):
     self.car_docs = []
 
