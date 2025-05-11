@@ -116,6 +116,8 @@ class CarState(CarStateBase):
     self.steering_angle = FirstOrderFilter(None, 0.5, DT_CTRL, initialized=False)
     self.offset_counter = 0
 
+    self.main_button = 0
+
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
     cp_actuator = can_parsers[Bus.cam]
