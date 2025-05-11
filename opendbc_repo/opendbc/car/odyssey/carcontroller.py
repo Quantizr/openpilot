@@ -119,6 +119,8 @@ class CarController(CarControllerBase, MadsCarController):
     self.brake = 0.0
     self.last_torque = 0.0
 
+    self.apply_steer_last = 0
+
   def update(self, CC, CC_SP, CS, now_nanos):
     MadsCarController.update(self, self.CP, CC, CC_SP)
     actuators = CC.actuators
@@ -270,7 +272,7 @@ class CarController(CarControllerBase, MadsCarController):
     new_actuators.steer = self.apply_steer_last / CarControllerParams.STEER_MAX
     new_actuators.steerOutputCan = self.apply_steer_last
 
-    new_actuators.speed = self.calc_desired_speed
+    # new_actuators.speed = self.calc_desired_speed
 
     self.frame += 1
 
