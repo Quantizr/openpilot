@@ -247,7 +247,7 @@ class CarController(CarControllerBase, MadsCarController):
     if not steer_error: # don't send steer CAN tx if steering is unavailable
       # *** apply steering torque ***
       if CC.enabled:
-        new_steer = actuators.steer * CarControllerParams.STEER_MAX
+        new_steer = actuators.torque * CarControllerParams.STEER_MAX
         # explicitly clip torque before sending on CAN
         apply_steer = apply_dist_to_meas_limits(new_steer, self.apply_steer_last, CS.out.steeringTorqueEps,
                                             CarControllerParams.STEER_DELTA_UP, CarControllerParams.STEER_DELTA_DOWN,
@@ -264,7 +264,7 @@ class CarController(CarControllerBase, MadsCarController):
     # debug
     if CC.enabled and (self.frame % 10) == 0: #slow print
       frame_number = self.frame
-      print(f"Steering req: {actuators.steer}, Speed: {CS.out.vEgoCluster}, Frame number: {frame_number}")
+      print(f"Steering req: {actuators.torque}, Speed: {CS.out.vEgoCluster}, Frame number: {frame_number}")
 
     self.cruise_enabled_prev = CC.enabled
 
