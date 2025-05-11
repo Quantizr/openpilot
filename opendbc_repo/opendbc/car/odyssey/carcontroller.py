@@ -102,9 +102,9 @@ class CarController(CarControllerBase, MadsCarController):
   def __init__(self, dbc_names, CP, CP_SP):
     CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
     MadsCarController.__init__(self)
-    self.packer = CANPacker(dbc_names[Bus.pt])
-    self.params = CarControllerParams(CP)
-    self.CAN = hondacan.CanBus(CP)
+    # self.packer = CANPacker(dbc_names[Bus.pt])
+    # self.params = CarControllerParams(CP)
+    # self.CAN = hondacan.CanBus(CP)
 
     self.braking = False
     self.brake_steady = 0.
@@ -123,7 +123,7 @@ class CarController(CarControllerBase, MadsCarController):
     MadsCarController.update(self, self.CP, CC, CC_SP)
     actuators = CC.actuators
     # hud_control = CC.hudControl
-    conversion = hondacan.get_cruise_speed_conversion(self.CP.carFingerprint, CS.is_metric)
+    # conversion = hondacan.get_cruise_speed_conversion(self.CP.carFingerprint, CS.is_metric)
     # hud_v_cruise = hud_control.setSpeed / conversion if hud_control.speedVisible else 255
     # pcm_cancel_cmd = CC.cruiseControl.cancel
 
