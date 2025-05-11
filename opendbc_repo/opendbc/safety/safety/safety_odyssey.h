@@ -390,9 +390,30 @@ static bool honda_tx_hook(const CANPacket_t *to_send) {
 
 
 static safety_config honda_odyssey_init(uint16_t param) {
+  // UNUSED(param);
+  // controls_allowed = false;
+  // honda_speed = 0;
+
+  // safety_config ret;
+  // return ret;
+
+  static const CanMsg ODYSSEY_TX_MSGS[] = {{0x22E, 1, 8, .check_relay = false}}; //STEERING_COMMAND
+
+  static RxCheck odyssey_rx_checks[] = {
+    {.msg = {{0x405, 0, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 3U}, { 0 }, { 0 }}}, //BODY
+    {.msg = {{0x6A, 0, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 143U}, { 0 }, { 0 }}}, //BRAKE_PRESSURE
+    {.msg = {{0xD4, 0, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 100U}, { 0 }, { 0 }}}, //CRUISE_CONTROL
+    {.msg = {{0xAA, 0, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 100U}, { 0 }, { 0 }}}, //DRIVER_THROTTLE_POSITION
+    {.msg = {{0xC8, 0, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 100U}, { 0 }, { 0 }}}, //ENGINE_DATA
+    {.msg = {{0x188, 0, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 100U}, { 0 }, { 0 }}}, //GEARBOX
+    {.msg = {{0x1F4, 0, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 25U}, { 0 }, { 0 }}}, //LIGHTS
+    {.msg = {{0x12C, 0, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 100U}, { 0 }, { 0 }}}, //POWERTRAIN_DATA
+    {.msg = {{0x1C0, 0, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 48U}, { 0 }, { 0 }}}, //WHEEL_SPEEDS
+    {.msg = {{0x22F, 1, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 100U}, { 0 }, { 0 }}}, //STEERING_STATUS
+  };
+
   UNUSED(param);
-  controls_allowed = false;
-  honda_speed = 0;
+  return BUILD_SAFETY_CFG(odyssey_rx_checks, ODYSSEY_TX_MSGS);
 }
 
 
@@ -400,7 +421,7 @@ const safety_hooks honda_odyssey_hooks = {
   .init = honda_odyssey_init,
   .rx = honda_rx_hook,
   .tx = honda_tx_hook,
-  .get_counter = honda_get_counter,
-  .get_checksum = honda_get_checksum,
-  .compute_checksum = honda_compute_checksum,
+  // .get_counter = honda_get_counter,
+  // .get_checksum = honda_get_checksum,
+  // .compute_checksum = honda_compute_checksum,
 };
