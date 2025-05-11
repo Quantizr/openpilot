@@ -202,8 +202,8 @@ class CarState(CarStateBase):
     # ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_stalk(
     #   250, cp.vl["SCM_FEEDBACK"]["LEFT_BLINKER"], cp.vl["SCM_FEEDBACK"]["RIGHT_BLINKER"])
 
-    ret.leftBlinker = cp.vl["Lights"]["LEFT_TURN_SIGNAL"] == 1
-    ret.rightBlinker = cp.vl["Lights"]["RIGHT_TURN_SIGNAL"] == 1
+    ret.leftBlinker = cp.vl["LIGHTS"]["LEFT_TURN_SIGNAL"] == 1
+    ret.rightBlinker = cp.vl["LIGHTS"]["RIGHT_TURN_SIGNAL"] == 1
 
     ret.steeringPressed = False
     ret.steeringTorque = 0
