@@ -2462,6 +2462,24 @@ struct EncodeData {
   height @5 :UInt32;
 }
 
+# struct AudioEncodeData {
+#   idx @0 :EncodeIndex;
+#   data @1 :Data;
+# }
+
+struct AudioEncodeData {
+  idx @0 :EncodeIndex;
+  data @1 :Data;
+  header @2 :Data;
+  codecId @3 :UInt32;
+  bitrate @4 :UInt32;
+  sampleRate @5 :UInt32;
+
+  # startTimestamp @4 :UInt64;
+  # segmentNum @5 :Int32;
+  # segmentId @6 :UInt32;
+}
+
 struct DebugAlert {
   alertText1 @0 :Text;
   alertText2 @1 :Text;
@@ -2483,6 +2501,7 @@ struct SoundPressure @0xdc24138990726023 {
 struct AudioData {
   data @0 :Data;
   sampleRate @1 :UInt32;
+  startFrameIdx @2 :UInt64;
 }
 
 struct Touch {
@@ -2594,6 +2613,8 @@ struct Event {
     driverEncodeData @87 :EncodeData;
     wideRoadEncodeData @88 :EncodeData;
     qRoadEncodeData @89 :EncodeData;
+    audioEncodeData @148 :AudioEncodeData;
+
     alertDebug @133 :DebugAlert;
 
     livestreamRoadEncodeData @120 :EncodeData;

@@ -108,6 +108,7 @@ const EncoderInfo qcam_encoder_info = {
   .frame_width = 526,
   .frame_height = 330,
   .include_audio = Params().getBool("RecordAudio"),
+  // TODO: add audio_encode_type, bitrate
   INIT_ENCODE_FUNCTIONS(QRoadEncode),
 };
 

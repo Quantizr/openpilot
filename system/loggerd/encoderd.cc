@@ -2,6 +2,7 @@
 
 #include "system/loggerd/loggerd.h"
 #include "system/loggerd/encoder/jpeg_encoder.h"
+#include "system/loggerd/encoder/audio_encoder.h"
 
 #ifdef QCOM2
 #include "system/loggerd/encoder/v4l_encoder.h"
@@ -21,6 +22,10 @@ struct EncoderdState {
   std::atomic<uint32_t> start_frame_id = 0;
   bool camera_ready[VISION_STREAM_WIDE_ROAD + 1] = {};
   bool camera_synced[VISION_STREAM_WIDE_ROAD + 1] = {};
+
+  bool audio_ready = false;
+  bool audio_synced = false;
+  uint64_t audio_start_frame_id = 0;
 };
 
 // Handle initial encoder syncing by waiting for all encoders to reach the same frame id
@@ -44,6 +49,21 @@ bool sync_encoders(EncoderdState *s, VisionStreamType cam_type, uint32_t frame_i
   }
 }
 
+bool sync_audio_encoder(EncoderdState *s, uint64_t frame_id) {
+  if (s->audio_synced) return true;
+  if (s->max_waiting > 1 && s->encoders_ready != s->max_waiting) {
+    s->audio_start_frame_id = frame_id;
+    if (std::exchange(s->audio_ready, true) == false) {
+      ++s->encoders_ready;
+      LOGD("audio encoder ready");
+    }
+    return false;
+  } else {
+    s->audio_start_frame_id = frame_id;
+    s->audio_synced = true;
+    return true;
+  }
+}
 
 void encoder_thread(EncoderdState *s, const LogCameraInfo &cam_info) {
   util::set_thread_name(cam_info.thread_name);
@@ -124,6 +144,53 @@ void encoder_thread(EncoderdState *s, const LogCameraInfo &cam_info) {
   }
 }
 
+void audio_encoder_thread(EncoderdState *s) { // TODO: this should've just been in encoder_thread, by checking encoder_info.has_audio and rotating with the corresponding encoder_thread. This needs a audioEncodeData per encode stream though.
+  util::set_thread_name("audio_encoder");
+
+  const int sample_rate = 16000;
+  const int bitrate = 32000;
+
+  AudioEncoder audio_encoder(AV_CODEC_ID_AAC, sample_rate, bitrate);
+  std::unique_ptr<Context> ctx(Context::create());
+  SubSocket *sock = SubSocket::create(ctx.get(), "rawAudioData");
+  assert(sock != NULL);
+  int cur_seg = 0;
+  bool encoder_opened = false;
+  while (!do_exit) {
+    if (!encoder_opened) {
+      audio_encoder.encoder_open();
+      encoder_opened = true;
+      LOGD("Audio encoder opened for segment %d", cur_seg);
+    }
+
+    Message *msg = sock->receive(true);
+    if (msg != nullptr) {
+      capnp::FlatArrayMessageReader cmsg(kj::ArrayPtr<capnp::word>((capnp::word *)msg->getData(), msg->getSize() / sizeof(capnp::word)));
+      auto event = cmsg.getRoot<cereal::Event>();
+      auto audio_data = event.getRawAudioData().getData();
+      uint64_t start_frame_idx = event.getRawAudioData().getStartFrameIdx();
+
+      if (!sync_audio_encoder(s, start_frame_idx)) continue;
+
+      const int samples_per_seg = SEGMENT_LENGTH * sample_rate;
+      // LOGE("segment num %f", (float) start_frame_idx/samples_per_seg);
+      if (cur_seg >= 0 && start_frame_idx >= ((cur_seg + 1) * samples_per_seg) + s->audio_start_frame_id) {
+        LOGE("Audio encoder rotating from segment %d to %d", cur_seg, cur_seg + 1);
+        audio_encoder.encoder_close();
+        audio_encoder.encoder_open();
+        ++cur_seg;
+      }
+
+      audio_encoder.encode_audio_data((uint8_t*)audio_data.begin(), audio_data.size(), event.getLogMonoTime()); // convert to microseconds
+      delete msg;
+    }
+    util::sleep_for(10);
+  }
+
+  audio_encoder.encoder_close();
+  delete sock;
+}
+
 template <size_t N>
 void encoderd_thread(const LogCameraInfo (&cameras)[N]) {
   EncoderdState s;
@@ -147,7 +214,25 @@ void encoderd_thread(const LogCameraInfo (&cameras)[N]) {
       encoder_threads.push_back(std::thread(encoder_thread, &s, *it));
     }
 
+    bool has_audio = false;
+    for (const auto &cam : cameras) {
+      for (const auto &encoder_info : cam.encoder_infos) {
+        if (encoder_info.include_audio) {
+          has_audio = true;
+          break;
+        }
+      }
+      if (has_audio) break;
+    }
+    std::thread audio_thread;
+    if (has_audio) {
+      LOGE("Starting audio encoder thread");
+      ++s.max_waiting;
+      audio_thread = std::thread(audio_encoder_thread, &s);
+    }
+
     for (auto &t : encoder_threads) t.join();
+    if (audio_thread.joinable()) audio_thread.join();
   }
 }
 

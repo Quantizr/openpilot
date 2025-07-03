@@ -82,9 +82,9 @@ size_t write_encode_data(LoggerdState *s, cereal::Event::Reader event, RemoteEnc
       if (encoder_info.record) {
         assert(encoder_info.filename != NULL);
         re.writer.reset(new VideoWriter(s->logger.segmentPath().c_str(),
-                                        encoder_info.filename, idx.getType() != cereal::EncodeIndex::Type::FULL_H_E_V_C,
-                                        edata.getWidth(), edata.getHeight(), encoder_info.fps, idx.getType(),
-                                        encoder_info.include_audio));
+                                       encoder_info.filename, idx.getType() != cereal::EncodeIndex::Type::FULL_H_E_V_C,
+                                       edata.getWidth(), edata.getHeight(), encoder_info.fps, idx.getType(),
+                                       encoder_info.include_audio));
         // write the header
         auto header = edata.getHeader();
         re.writer->write((uint8_t *)header.begin(), header.size(), idx.getTimestampEof() / 1000, true, false);
@@ -117,14 +117,24 @@ size_t write_encode_data(LoggerdState *s, cereal::Event::Reader event, RemoteEnc
   return new_msg.size();
 }
 
-int handle_encoder_msg(LoggerdState *s, Message *msg, std::string &name, struct RemoteEncoder &re, const EncoderInfo &encoder_info) {
+void write_audio_encode_data(LoggerdState *s, cereal::Event::Reader event, std::vector<RemoteEncoder*> &encoders_with_audio) {
+  auto edata = event.getAudioEncodeData();
+  auto idx = edata.getIdx();
+  auto data = edata.getData();
+  for (auto* encoder : encoders_with_audio) {
+    if (encoder && encoder->writer && encoder->recording) {
+      encoder->writer->write_encoded_audio((uint8_t*)data.begin(), data.size(), idx.getTimestampEof() / 1000);
+    }
+  }
+}
+
+int handle_encoder_msg(LoggerdState *s, Message *msg, std::string &name, struct RemoteEncoder &re, const EncoderInfo &encoder_info, std::vector<RemoteEncoder*> &encoders_with_audio) {
   int bytes_count = 0;
 
   // extract the message
   capnp::FlatArrayMessageReader cmsg(kj::ArrayPtr<capnp::word>((capnp::word *)msg->getData(), msg->getSize() / sizeof(capnp::word)));
   auto event = cmsg.getRoot<cereal::Event>();
-  auto edata = (event.*(encoder_info.get_encode_data_func))();
-  auto idx = edata.getIdx();
+  auto idx = (name == "audioEncodeData") ? event.getAudioEncodeData().getIdx() : (event.*(encoder_info.get_encode_data_func))().getIdx();
 
   // encoderd can have started long before loggerd
   if (!re.seen_first_packet) {
@@ -149,13 +159,22 @@ int handle_encoder_msg(LoggerdState *s, Message *msg, std::string &name, struct 
       if (!re.q.empty()) {
         for (auto qmsg : re.q) {
           capnp::FlatArrayMessageReader reader({(capnp::word *)qmsg->getData(), qmsg->getSize() / sizeof(capnp::word)});
-          bytes_count += write_encode_data(s, reader.getRoot<cereal::Event>(), re, encoder_info);
+          if (name == "audioEncodeData") {
+            write_audio_encode_data(s, reader.getRoot<cereal::Event>(), encoders_with_audio);
+          } else {
+            bytes_count += write_encode_data(s, reader.getRoot<cereal::Event>(), re, encoder_info);
+          }
           delete qmsg;
         }
         re.q.clear();
       }
     }
-    bytes_count += write_encode_data(s, event, re, encoder_info);
+    if (name == "audioEncodeData") {
+      write_audio_encode_data(s, event, encoders_with_audio);
+    } else {
+      bytes_count += write_encode_data(s, event, re, encoder_info);
+    }
+
     delete msg;
   } else if (offset_segment_num > s->logger.segment()) {
     // encoderd packet has a newer segment, this means encoderd has rolled over
@@ -177,7 +196,7 @@ int handle_encoder_msg(LoggerdState *s, Message *msg, std::string &name, struct 
     }
   } else {
     LOGE("%s: encoderd packet has a older segment!!! idx.getSegmentNum():%d s->logger.segment():%d re.encoderd_segment_offset:%d",
-      name.c_str(), idx.getSegmentNum(), s->logger.segment(), re.encoderd_segment_offset);
+         name.c_str(), idx.getSegmentNum(), s->logger.segment(), re.encoderd_segment_offset);
     // free the message, it's useless. this should never happen
     // actually, this can happen if you restart encoderd
     re.encoderd_segment_offset = -s->logger.segment();
@@ -252,12 +271,14 @@ void loggerd_thread() {
 
   std::map<std::string, EncoderInfo> encoder_infos_dict;
   std::vector<RemoteEncoder*> encoders_with_audio;
+  bool has_audio_encoder = false;
   for (const auto &cam : cameras_logged) {
     for (const auto &encoder_info : cam.encoder_infos) {
       encoder_infos_dict[encoder_info.publish_name] = encoder_info;
       s.max_waiting++;
 
       if (encoder_info.include_audio) {
+        has_audio_encoder = true;
         for (auto& [sock, service] : service_state) {
           if (service.name == encoder_info.publish_name) {
             encoders_with_audio.push_back(&remote_encoders[sock]);
@@ -267,6 +288,7 @@ void loggerd_thread() {
       }
     }
   }
+  if (has_audio_encoder) s.max_waiting++;
 
   uint64_t msg_count = 0, bytes_count = 0;
   double start_ts = millis_since_boot();
@@ -286,20 +308,9 @@ void loggerd_thread() {
       while (!do_exit && (msg = sock->receive(true))) {
         const bool in_qlog = service.freq != -1 && (service.counter++ % service.freq == 0);
 
-        if (service.record_audio) {
-          capnp::FlatArrayMessageReader cmsg(kj::ArrayPtr<capnp::word>((capnp::word *)msg->getData(), msg->getSize() / sizeof(capnp::word)));
-          auto event = cmsg.getRoot<cereal::Event>();
-          auto audio_data = event.getRawAudioData().getData();
-          for (auto* encoder : encoders_with_audio) {
-            if (encoder && encoder->writer) {
-              encoder->writer->write_audio((uint8_t*)audio_data.begin(), audio_data.size(), event.getLogMonoTime()/1000);
-            }
-          }
-        }
-
         if (service.encoder) {
           s.last_camera_seen_tms = millis_since_boot();
-          bytes_count += handle_encoder_msg(&s, msg, service.name, remote_encoders[sock], encoder_infos_dict[service.name]);
+          bytes_count += handle_encoder_msg(&s, msg, service.name, remote_encoders[sock], encoder_infos_dict[service.name], encoders_with_audio);
         } else {
           s.logger.write((uint8_t *)msg->getData(), msg->getSize(), in_qlog);
           bytes_count += msg->getSize();
