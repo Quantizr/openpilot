@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os
 from openpilot.system.hardware import TICI
-os.environ['DEV'] = 'QCOM' if TICI else 'LLVM'
+os.environ['DEV'] = 'QCOM' if TICI else 'CUDA'
 USBGPU = "USBGPU" in os.environ
 if USBGPU:
   os.environ['DEV'] = 'AMD'
@@ -114,7 +114,6 @@ def send_full(sock: socket.socket, iov: list[memoryview], flags: int) -> None:
     to_send  -= sent
 
 
-
 class FrameMeta:
   frame_id: int = 0
   timestamp_sof: int = 0
@@ -133,21 +132,21 @@ class ModelState:
   def __init__(self, context: CLContext):
     with open(VISION_METADATA_PATH, 'rb') as f:
       vision_metadata = pickle.load(f)
-      self.vision_input_shapes = vision_metadata['input_shapes']
+      self.vision_input_shapes =  vision_metadata['input_shapes']
       self.vision_input_names = list(self.vision_input_shapes.keys())
       self.vision_output_slices = vision_metadata['output_slices']
       self.vision_output_size = vision_metadata['output_shapes']['outputs'][1]
 
     with open(POLICY_METADATA_PATH, 'rb') as f:
       policy_metadata = pickle.load(f)
-      self.policy_input_shapes = policy_metadata['input_shapes']
+      self.policy_input_shapes =  policy_metadata['input_shapes']
       self.policy_output_slices = policy_metadata['output_slices']
       self.policy_output_size = policy_metadata['output_shapes']['outputs'][1]
 
     self.frames = {name: DrivingModelFrame(context, ModelConstants.TEMPORAL_SKIP) for name in self.vision_input_names}
     self.prev_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
 
-    self.full_features_buffer = np.zeros((1, ModelConstants.FULL_HISTORY_BUFFER_LEN, ModelConstants.FEATURE_LEN), dtype=np.float32)
+    self.full_features_buffer = np.zeros((1, ModelConstants.FULL_HISTORY_BUFFER_LEN,  ModelConstants.FEATURE_LEN), dtype=np.float32)
     self.full_desire = np.zeros((1, ModelConstants.FULL_HISTORY_BUFFER_LEN, ModelConstants.DESIRE_LEN), dtype=np.float32)
     self.temporal_idxs = slice(-1-(ModelConstants.TEMPORAL_SKIP*(ModelConstants.INPUT_HISTORY_BUFFER_LEN-1)), None, ModelConstants.TEMPORAL_SKIP)
 
@@ -209,7 +208,6 @@ class ModelState:
           time.sleep(3)
       else:
         time.sleep(1)
-
 
   def _io_thread(self):
     while True:
@@ -286,22 +284,20 @@ class ModelState:
         except queue.Full:
           pass
 
-
   def slice_outputs(self, model_outputs: np.ndarray, output_slices: dict[str, slice]) -> dict[str, np.ndarray]:
-    parsed_model_outputs = {k: model_outputs[np.newaxis, v] for k, v in output_slices.items()}
+    parsed_model_outputs = {k: model_outputs[np.newaxis, v] for k,v in output_slices.items()}
     return parsed_model_outputs
 
-  def run(
-    self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray], inputs: dict[str, np.ndarray], prepare_only: bool
-) -> dict[str, np.ndarray] | None:
+  def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
+                inputs: dict[str, np.ndarray], prepare_only: bool) -> dict[str, np.ndarray] | None:
     # Model decides when action is completed, so desire input is just a pulse triggered on rising edge
     inputs['desire'][0] = 0
-    new_desire = np.where(inputs['desire'] - self.prev_desire > 0.99, inputs['desire'], 0)
+    new_desire = np.where(inputs['desire'] - self.prev_desire > .99, inputs['desire'], 0)
     self.prev_desire[:] = inputs['desire']
 
-    self.full_desire[0, :-1] = self.full_desire[0, 1:]
-    self.full_desire[0, -1] = new_desire
-    self.numpy_inputs['desire'][:] = self.full_desire.reshape((1, ModelConstants.INPUT_HISTORY_BUFFER_LEN, ModelConstants.TEMPORAL_SKIP, -1)).max(axis=2)
+    self.full_desire[0,:-1] = self.full_desire[0,1:]
+    self.full_desire[0,-1] = new_desire
+    self.numpy_inputs['desire'][:] = self.full_desire.reshape((1,ModelConstants.INPUT_HISTORY_BUFFER_LEN,ModelConstants.TEMPORAL_SKIP,-1)).max(axis=2)
 
     self.numpy_inputs['traffic_convention'][:] = inputs['traffic_convention']
     imgs_cl = {name: self.frames[name].prepare(bufs[name], transforms[name].flatten()) for name in self.vision_input_names}
@@ -334,8 +330,7 @@ class ModelState:
 
     extras = (
         new_desire.astype(np.float32).tobytes() +
-        inputs['traffic_convention'].astype(np.float32).tobytes() +
-        inputs['lateral_control_params'].astype(np.float32).tobytes()
+        inputs['traffic_convention'].astype(np.float32).tobytes()
     )
     iovecs.append(memoryview(extras))
 
@@ -357,11 +352,6 @@ class ModelState:
 
     local_policy_output = self.policy_run(**self.policy_inputs).contiguous().realize().uop.base.buffer.numpy()
     local_policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(local_policy_output, self.policy_output_slices))
-
-    # TODO model only uses last value now
-    self.full_prev_desired_curv[0, :-1] = self.full_prev_desired_curv[0, 1:]
-    self.full_prev_desired_curv[0, -1, :] = local_policy_outputs_dict['desired_curvature'][0, :]
-    self.numpy_inputs['prev_desired_curv'][:] = 0 * self.full_prev_desired_curv[0, self.temporal_idxs]
 
     # pick winner at ~30 ms (skip wait if link down)
     elapsed_ns = time.perf_counter_ns() - t0
@@ -551,7 +541,7 @@ def main(demo=False):
 
     bufs = {name: buf_extra if 'big' in name else buf_main for name in model.vision_input_names}
     transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
-    inputs:dict[str, np.ndarray] = {
+    inputs: dict[str, np.ndarray] = {
       'desire': vec_desire,
       'traffic_convention': traffic_convention,
     }
