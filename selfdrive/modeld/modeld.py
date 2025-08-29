@@ -10,6 +10,10 @@ from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 import time
 import pickle
+import socket
+import struct
+import threading
+import queue
 import numpy as np
 import cereal.messaging as messaging
 from cereal import car, log
@@ -44,6 +48,12 @@ LAT_SMOOTH_SECONDS = 0.1
 LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
 
+# --- Remote GPU Configuration ---
+HOST = os.getenv("GPU_REMOTE_HOST", "10.42.0.1")
+PORT = int(os.getenv("GPU_REMOTE_PORT", 5501))
+ALLOWED_DELAY_MS = int(os.getenv("ALLOWED_DELAY_MS", 50))
+MAX_RTT_MS = ALLOWED_DELAY_MS + 15
+# --- End Remote GPU Configuration ---
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
                           lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
@@ -67,6 +77,30 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
     return log.ModelDataV2.Action(desiredCurvature=float(desired_curvature),
                                   desiredAcceleration=float(desired_accel),
                                   shouldStop=bool(should_stop))
+
+def send_full(sock: socket.socket, iov: list[memoryview], flags: int = 0) -> None:
+  """Repeatedly call sendmsg until every byte from `iov` is queued."""
+  if not hasattr(socket, "MSG_ZEROCOPY"): flags = 0
+  iov_view = iov
+  to_send = sum(len(v) for v in iov_view)
+  while to_send:
+    try:
+      sent = sock.sendmsg(iov_view, (), flags)
+      if sent == 0: raise OSError("socket closed during send")
+    except (BlockingIOError, InterruptedError): continue
+    except Exception as e: raise e
+
+    remaining = sent
+    idx = 0
+    while remaining and idx < len(iov_view):
+      if remaining >= len(iov_view[idx]):
+        remaining -= len(iov_view[idx])
+        idx += 1
+      else:
+        iov_view[idx] = iov_view[idx][remaining:]
+        remaining = 0
+    iov_view = iov_view[idx:]
+    to_send -= sent
 
 class FrameMeta:
   frame_id: int = 0
@@ -178,42 +212,229 @@ class ModelState:
     with open(POLICY_PKL_PATH, "rb") as f:
       self.policy_run = pickle.load(f)
 
+    # --- Race-the-remote setup ---
+    self.request_q = queue.Queue(maxsize=2)
+    self.response_dict = {}
+    self.response_lock = threading.Lock()
+    self.response_event = threading.Event()
+    self.seq_counter = 0
+    self.remote_is_ready = False
+
+    self.sock_lock = threading.Lock()
+    self.current_sock = None
+    self.link_status = False
+
+    self.connector_thread = threading.Thread(target=self._connector_thread, daemon=True)
+    self.connector_thread.start()
+    self.io_thread = threading.Thread(target=self._io_thread, daemon=True)
+    self.io_thread.start()
+    # --- End race-the-remote setup ---
+
+  def _build_request_packet(self, seq: int, reset_flag: bool, arrays: dict[str, np.ndarray]) -> list[memoryview]:
+    """Builds a packet with a self-describing header and zero-copy data."""
+    flags = 1 if reset_flag else 0
+    # Header: seq (I), flags (B), num_arrays (B)
+    header = struct.pack("!IBB", seq, flags, len(arrays))
+    descriptors = bytearray()
+    data_parts = []
+
+    for name, arr in arrays.items():
+      name_bytes, dtype_bytes = name.encode('utf-8'), str(arr.dtype).encode('utf-8')
+      shape_bytes = struct.pack("!" + "I" * len(arr.shape), *arr.shape)
+      descriptors += struct.pack("!B", len(name_bytes)) + name_bytes
+      descriptors += struct.pack("!B", len(dtype_bytes)) + dtype_bytes
+      descriptors += struct.pack("!B", len(arr.shape)) + shape_bytes
+      data_parts.append(memoryview(arr).cast('B'))
+
+    return [memoryview(header), memoryview(descriptors)] + data_parts
+
+  def _parse_response_packet(self, data: bytes) -> dict[str, np.ndarray]:
+    """Parses a response packet from the server."""
+    offset = 0
+    # Header: seq (I), flags (B), num_arrays (B)
+    seq, flags, num_arrays = struct.unpack_from("!IBB", data, offset)
+    offset += 6
+    arrays = {'seq': seq, 'is_ready': bool(flags & 1)}
+
+    descriptors = []
+    descriptor_offset = offset
+    for _ in range(num_arrays):
+      name_len = data[descriptor_offset]
+      descriptor_offset += 1
+      name = data[descriptor_offset:descriptor_offset+name_len].decode('utf-8')
+      descriptor_offset += name_len
+      dtype_len = data[descriptor_offset]
+      descriptor_offset += 1
+      dtype = data[descriptor_offset:descriptor_offset+dtype_len].decode('utf-8')
+      descriptor_offset += dtype_len
+      num_dims = data[descriptor_offset]
+      descriptor_offset += 1
+      shape = struct.unpack_from("!" + "I" * num_dims, data, descriptor_offset)
+      descriptor_offset += 4 * num_dims
+      descriptors.append({'name': name, 'dtype': np.dtype(dtype), 'shape': shape})
+
+    data_offset = descriptor_offset
+    for desc in descriptors:
+      num_bytes = int(np.prod(desc['shape'])) * desc['dtype'].itemsize
+      arr = np.frombuffer(data, dtype=desc['dtype'], count=int(np.prod(desc['shape'])), offset=data_offset).reshape(desc['shape'])
+      arrays[desc['name']] = arr
+      data_offset += num_bytes
+    return arrays
+
+  def _connector_thread(self):
+    while True:
+      if self.current_sock is None:
+        try:
+          cloudlog.info("modeld.race: attempting to connect to remote")
+          sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          sock.settimeout(5)
+          sock.connect((HOST, PORT))
+          sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+          with self.sock_lock:
+            self.current_sock = sock
+            self.link_status = True
+            self.remote_is_ready = False # Reset readiness on new connection
+          cloudlog.info("modeld.race: connection to remote established.")
+        except (OSError, socket.timeout) as e:
+          cloudlog.warning(f"modeld.race: connection failed: {e}")
+          self.link_status = False
+          time.sleep(3)
+      else:
+        time.sleep(1)
+
+  def _io_thread(self):
+    while True:
+      try:
+        seq, iovecs = self.request_q.get(timeout=1)
+      except queue.Empty: continue
+
+      sock = None
+      with self.sock_lock:
+        if self.link_status: sock = self.current_sock
+
+      if sock is None:
+        time.sleep(1)
+        continue
+
+      try:
+        t_req = time.perf_counter_ns()
+        # Prepend 4-byte total length header
+        total_len = sum(len(v) for v in iovecs)
+        send_full(sock, [memoryview(struct.pack("!I", total_len))] + iovecs, getattr(socket, 'MSG_ZEROCOPY', 0))
+
+        # Receive: 4-byte length header + response data
+        raw_len = sock.recv(4, socket.MSG_WAITALL)
+        if len(raw_len) < 4: raise OSError("short header")
+        out_len = struct.unpack("!I", raw_len)[0]
+
+        response_data = sock.recv(out_len, socket.MSG_WAITALL)
+        if len(response_data) < out_len: raise OSError("short response")
+
+        rtt_ms = (time.perf_counter_ns() - t_req) / 1e6
+        if rtt_ms > MAX_RTT_MS:
+          cloudlog.warning(f"modeld.race: remote response stale, RTT {rtt_ms:.1f}ms > {MAX_RTT_MS}ms")
+          continue
+
+        response = self._parse_response_packet(response_data)
+        if response.get('seq') != seq: continue
+
+        with self.response_lock:
+          self.response_dict[seq] = response
+          self.remote_is_ready = response.get('is_ready', False)
+          self.response_event.set()
+
+      except (OSError, socket.timeout, struct.error) as e:
+        cloudlog.warning(f"modeld.race: IO error: {e}. Tearing down link.")
+        with self.sock_lock:
+          if self.current_sock == sock:
+            sock.close()
+            self.current_sock = None
+            self.link_status = False
+            self.remote_is_ready = False
+
   def slice_outputs(self, model_outputs: np.ndarray, output_slices: dict[str, slice]) -> dict[str, np.ndarray]:
     parsed_model_outputs = {k: model_outputs[np.newaxis, v] for k,v in output_slices.items()}
     return parsed_model_outputs
 
+
   def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
                 inputs: dict[str, np.ndarray], prepare_only: bool) -> dict[str, np.ndarray] | None:
     # Model decides when action is completed, so desire input is just a pulse triggered on rising edge
+
+    # --- 1. Common Pre-processing ---
     inputs['desire_pulse'][0] = 0
     new_desire = np.where(inputs['desire_pulse'] - self.prev_desire > .99, inputs['desire_pulse'], 0)
     self.prev_desire[:] = inputs['desire_pulse']
 
     imgs_cl = {name: self.frames[name].prepare(bufs[name], transforms[name].flatten()) for name in self.vision_input_names}
+    vision_numpy_inputs = {k: self.frames[k].buffer_from_cl(v).reshape(self.vision_input_shapes[k]) for k, v in imgs_cl.items()}
 
+    # --- 2. Start Race: Dispatch Remote Job (even if preparing, to signal reset) ---
+    t0 = time.perf_counter_ns()
+    seq = self.seq_counter
+    self.seq_counter = (self.seq_counter + 1) % (1 << 32)
+    reset_flag = prepare_only
+
+    if self.link_status:
+      if reset_flag: self.remote_is_ready = False
+      all_inputs = {**vision_numpy_inputs, 'desire_pulse': new_desire, 'traffic_convention': inputs['traffic_convention']}
+      try:
+        iovecs = self._build_request_packet(seq, reset_flag, all_inputs)
+        self.request_q.put_nowait((seq, iovecs))
+      except queue.Full: pass
+
+    if prepare_only: return None
+
+    # --- 3. Run Local Model (Blocking) ---
+    for key, frame_input in vision_numpy_inputs.items():
+      self.vision_inputs[key] = Tensor(frame_input, dtype=dtypes.uint8).realize()
     if TICI and not USBGPU:
-      # The imgs tensors are backed by opencl memory, only need init once
       for key in imgs_cl:
         if key not in self.vision_inputs:
           self.vision_inputs[key] = qcom_tensor_from_opencl_address(imgs_cl[key].mem_address, self.vision_input_shapes[key], dtype=dtypes.uint8)
-    else:
-      for key in imgs_cl:
-        frame_input = self.frames[key].buffer_from_cl(imgs_cl[key]).reshape(self.vision_input_shapes[key])
-        self.vision_inputs[key] = Tensor(frame_input, dtype=dtypes.uint8).realize()
 
-    if prepare_only:
-      return None
+    local_vision_output = self.vision_run(**self.vision_inputs).contiguous().realize().uop.base.buffer.numpy()
+    local_vision_outputs_dict = self.parser.parse_vision_outputs(self.slice_outputs(local_vision_output, self.vision_output_slices))
 
-    self.vision_output = self.vision_run(**self.vision_inputs).contiguous().realize().uop.base.buffer.numpy()
-    vision_outputs_dict = self.parser.parse_vision_outputs(self.slice_outputs(self.vision_output, self.vision_output_slices))
-
-    self.full_input_queues.enqueue({'features_buffer': vision_outputs_dict['hidden_state'], 'desire_pulse': new_desire})
+    self.full_input_queues.enqueue({'features_buffer': local_vision_outputs_dict['hidden_state'], 'desire_pulse': new_desire})
     for k in ['desire_pulse', 'features_buffer']:
       self.numpy_inputs[k][:] = self.full_input_queues.get(k)[k]
     self.numpy_inputs['traffic_convention'][:] = inputs['traffic_convention']
 
-    self.policy_output = self.policy_run(**self.policy_inputs).contiguous().realize().uop.base.buffer.numpy()
-    policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_output, self.policy_output_slices))
+    local_policy_output = self.policy_run(**self.policy_inputs).contiguous().realize().uop.base.buffer.numpy()
+
+    # --- 4. Pick Winner ---
+    elapsed_ms = (time.perf_counter_ns() - t0) / 1e6
+    remote_response = None
+    final_vision_output = local_vision_output
+    final_policy_output = local_policy_output
+
+    if self.link_status:
+      with self.response_lock:
+        if seq in self.response_dict:
+          remote_response = self.response_dict.pop(seq)
+        elif elapsed_ms < ALLOWED_DELAY_MS:
+          self.response_event.clear()
+          self.response_lock.release()
+          self.response_event.wait((ALLOWED_DELAY_MS - elapsed_ms) / 1000)
+          self.response_lock.acquire()
+          if seq in self.response_dict:
+            remote_response = self.response_dict.pop(seq)
+
+    if remote_response:
+      remote_time_ms = remote_response.get('compute_us', np.array([0.]))[0] / 1000
+      if self.remote_is_ready:
+        final_vision_output = remote_response['vision_output'].copy()
+        final_policy_output = remote_response['policy_output'].copy()
+        cloudlog.info(f"Remote fully won: RTT {elapsed_ms:.1f}ms, remote compute {remote_time_ms:.1f}ms")
+      else:
+        cloudlog.info(f"Remote vision won, local policy fallback (priming): RTT {elapsed_ms:.1f}ms")
+    else:
+      cloudlog.info(f"Local fallback: {elapsed_ms:.1f}ms")
+
+    # --- 5. Post-processing with Winner's Output ---
+    vision_outputs_dict = self.parser.parse_vision_outputs(self.slice_outputs(final_vision_output, self.vision_output_slices))
+    policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(final_policy_output, self.policy_output_slices))
 
     combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
     if SEND_RAW_PRED:
