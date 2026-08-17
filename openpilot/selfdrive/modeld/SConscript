@@ -73,6 +73,22 @@ compile_modeld_script = [
 model_w, model_h = MEDMODEL_INPUT_SIZE
 frame_skip = ModelConstants.MODEL_RUN_FREQ // ModelConstants.MODEL_CONTEXT_FREQ
 
+# DSP split: distill_vision_v3.onnx is the whole vision student in ONE int8 graph -- STEM INCLUDED -- compiled
+# INSIDE compile_modeld (--dsp-onnx) into a Tensor.custom_kernel that runs on the Hexagon, policy on the GPU.
+# Needs the cDSP, which only exists on the comma device, so it is the default there and never on a dev machine.
+# MODELD_FUSED=1 forces the fused model (USBGPU always fused).
+MODELD_DSP = tg_backend == 'QCOM' and not bool(os.getenv('MODELD_FUSED'))
+if MODELD_DSP:
+  dsp_dir = f"{modeld_dir}/dsp"
+  dsp_vision_onnx = File("models/distill_vision_v3.onnx").abspath
+  # Everything that decides the kernel: the megakernel C, the compiler that emits its op list, and the vendored
+  # HVX asm + ld.lld. GLOB the .S rather than list them -- a hand-written list went stale three separate ways
+  # (named deleted files, named unlinked asm, covered 3 of the 10 actually linked) and under-declaring here
+  # silently ships a stale kernel, while over-declaring costs one spurious rebuild.
+  dsp_srcs = ([File(f"{dsp_dir}/megakernel.py"), File(f"{dsp_dir}/compile/lib/ld.lld"), File(dsp_vision_onnx)]
+              + [File(f"{dsp_dir}/compile/{f}") for f in ('build.py', 'lower.py', 'parse.py', 'megakernel.c')]
+              + [File(f) for f in glob.glob(f"{Dir('#').abspath}/{dsp_dir}/compile/lib/*.S")])
+
 for usbgpu in [False, True] if USBGPU else [False]:
   target_pkl_path = File(modeld_pkl_path(usbgpu)).abspath
   # BIG_INTO_SMALL=1 builds the default target from the big model, e.g. to test it without a USB GPU
@@ -81,12 +97,19 @@ for usbgpu in [False, True] if USBGPU else [False]:
   camera_res_args = ' '.join(f'{cw}x{ch}' for cw, ch in CAMERA_CONFIGS)
   # CPU 7 is isolated with isolcpus on AGNOS, so explicitly pin the compiler to it.
   taskset = 'taskset -c 7 ' if arch == 'comma_arm64' else ''
+  onnx_args = f'--onnx {File(f"models/{file_prefix}driving_supercombo.onnx").abspath}'
+  if MODELD_DSP and not usbgpu:
+    # --onnx is the policy half only (its metadata carries output_slices, via split_policy.py); the vision half is
+    # --dsp-onnx. Same run_policy + warp JITs as the fused path -- warp -> seed -> DSP vision -> policy, one frame.
+    driving_onnx_deps = [File("models/distill_policy.onnx").abspath] + dsp_srcs
+    onnx_args = f'--dsp --onnx {driving_onnx_deps[0]} --dsp-onnx {dsp_vision_onnx}'
   cmd = (f'{cmd_flags} {mac_brew_string} {taskset}python3 {modeld_dir}/compile_modeld.py '
         f'--model-size {model_w}x{model_h} '
         f'--camera-resolutions {camera_res_args} '
-        f'--onnx {File(f"models/{file_prefix}driving_supercombo.onnx").abspath} '
+        f'{onnx_args} '
         f'--output {target_pkl_path} --frame-skip {frame_skip}')
-  onnx_sizes_sum = sum(os.path.getsize(f) for f in driving_onnx_deps)
+  # the DSP deps are source files, not chunked onnx, so guard the size probe
+  onnx_sizes_sum = sum(os.path.getsize(f) for f in driving_onnx_deps if os.path.exists(f))
   chunk_targets = get_chunk_targets(target_pkl_path, estimate_pickle_max_size(onnx_sizes_sum))
   def do_compile(target, source, env, command=cmd, pkl=target_pkl_path, chunks=chunk_targets):
     from openpilot.system.hardware.chestnut.flash import link_up

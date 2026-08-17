@@ -26,7 +26,7 @@ from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, should_stop, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
-from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, WARP_INPUTS, POLICY_INPUTS
+from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, WARP_INPUTS, POLICY_INPUTS, VISION_INPUTS, POLICY_SPLIT_INPUTS
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.common.file_chunker import open_file_chunked
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
@@ -39,7 +39,6 @@ LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
 BIG_MODEL_TIMEOUT = 60
-
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
                           lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
@@ -67,7 +66,6 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
   return log.ModelDataV2.Action(desiredCurvature=float(desired_curvature),
                                 desiredAcceleration=float(desired_accel),
                                 shouldStop=bool(stop))
-
 
 class ChestnutState:
   # only modeld can access chestnut
@@ -123,7 +121,6 @@ class ChestnutState:
     msg.valid = asm_valid and (not self.big or self.valid)
     self.pm.send('chestnutState', msg)
 
-
 class FrameMeta:
   frame_id: int = 0
   timestamp_sof: int = 0
@@ -133,6 +130,23 @@ class FrameMeta:
     if vipc is not None:
       self.frame_id, self.timestamp_sof, self.timestamp_eof = vipc.frame_id, vipc.timestamp_sof, vipc.timestamp_eof
 
+class DSPVision:
+  """The whole int8 vision student (stem included) as ONE megakernel invoke on the Hexagon, run inline in the
+  policy's frame -- it is ~11.7ms against a 50ms budget, so paying it inline is cheaper than the frame of
+  latency a pipelined version costs (and which `frame_delay` then has to compensate for)."""
+  def __init__(self, mk):
+    from tinygrad.engine.jit import TinyJit
+    from openpilot.selfdrive.modeld.dsp.megakernel import megakernel
+    wts = Tensor(np.ascontiguousarray(mk['wts'], np.uint8), device="DSP").realize()
+    ops = Tensor(np.ascontiguousarray(mk['oplist'], np.int32), device="DSP").realize()
+    n = mk['layout'].seed_bytes
+    self.seed = Tensor(np.zeros(n, np.uint8), device="DSP").contiguous().realize()
+    self.seed_mv = np.asarray(self.seed.uop.buffer.as_memoryview(force_zero_copy=True))
+    self.run = TinyJit(lambda s: megakernel(s, wts, ops, mk['lib'], mk['src'], mk['layout']).realize())
+
+  def __call__(self, seed_np: np.ndarray) -> np.ndarray:
+    self.seed_mv[:] = seed_np.reshape(-1)
+    return self.run(self.seed).numpy().reshape(-1).astype(np.float32)
 
 class ModelState:
   prev_desire: np.ndarray  # for tracking the rising edge of the pulse
@@ -157,6 +171,12 @@ class ModelState:
     self.frame_buf_params = {k: get_nv12_info(cam_w, cam_h) for k in ('img', 'big_img')}
     self.run_policy = jits['run_policy']
     self.warp = jits[(cam_w,cam_h)]
+
+    self.dsp = metadata.get('dsp', False)
+    if self.dsp:
+      from openpilot.selfdrive.modeld.dsp.testsig import ensure_testsig
+      ensure_testsig()
+      self.run_seed, self.vision = jits['run_seed'], DSPVision(jits['dsp_mk'])
 
   def slice_outputs(self, model_outputs: np.ndarray, output_slices: dict[str, slice]) -> dict[str, np.ndarray]:
     parsed_model_outputs = {k: model_outputs[np.newaxis, v] for k,v in output_slices.items()}
@@ -184,8 +204,14 @@ class ModelState:
 
     warped = self.warp(**{k: self.input_queues[k] for k in WARP_INPUTS}, frame=self.full_frames['img'], big_frame=self.full_frames['big_img'])
 
+    if self.dsp:
+      seed, = self.run_seed(**{k: self.input_queues[k] for k in VISION_INPUTS}, warped=warped)
+      feat = self.vision(seed.numpy()[0])
+      policy_inputs = {'linear_80': Tensor(feat.reshape(1, -1), device='NPY').realize()}
+    else:
+      policy_inputs = {'warped': warped}
     outs, = self.run_policy(
-      **{k: self.input_queues[k] for k in POLICY_INPUTS if k in self.input_queues}, warped=warped
+      **{k: self.input_queues[k] for k in (POLICY_SPLIT_INPUTS if self.dsp else POLICY_INPUTS) if k in self.input_queues}, **policy_inputs
     )
     model_output = outs.numpy()[0]
     if self.usbgpu and not np.all(np.isfinite(model_output)):
@@ -193,7 +219,7 @@ class ModelState:
       cloudlog.error("model output not finite, dropping frame")
       return None
     outputs_dict = self.parser.parse_outputs(self.slice_outputs(model_output, self.output_slices))
-    self.npy['prev_feat'][:] = model_output[self.output_slices['hidden_state']]
+    self.npy['prev_feat'][:] = feat if self.dsp else model_output[self.output_slices['hidden_state']]
 
     if SEND_RAW_PRED:
       outputs_dict['raw_pred'] = model_output.copy()
@@ -208,7 +234,6 @@ class ModelState:
     self.prev_desire[:] = 0
     self.full_frames.clear()
     self._blob_cache.clear()
-
 
 def main(demo=False):
   cloudlog.warning("modeld init")
@@ -429,7 +454,6 @@ def main(demo=False):
 
     if chestnut_state is not None and run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0:
       chestnut_state.send()
-
 
 if __name__ == "__main__":
   try:

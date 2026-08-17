@@ -29,26 +29,24 @@ def _patch_tinygrad_fetch_fw():
   helpers.fetch_fw = fetch_fw
 _patch_tinygrad_fetch_fw()
 
-
 from tinygrad.tensor import Tensor
 from tinygrad.helpers import Context
 from tinygrad.device import Device
 from tinygrad.engine.jit import TinyJit
 
-
 NV12Frame = namedtuple("NV12Frame", ['width', 'height', 'stride', 'y_height', 'uv_height', 'size'])
 WARP_INPUTS = ['tfm', 'big_tfm']
 POLICY_INPUTS = ['img_q', 'big_img_q', 'feat_q', 'desire_q', 'packed_npy_inputs']
+VISION_INPUTS = ['img_q', 'big_img_q']
+POLICY_SPLIT_INPUTS = ['feat_q', 'desire_q', 'packed_npy_inputs']
 
 UV_SCALE_MATRIX = np.array([[0.5, 0, 0], [0, 0.5, 0], [0, 0, 1]], dtype=np.float32)
 UV_SCALE_MATRIX_INV = np.linalg.inv(UV_SCALE_MATRIX)
 
 WARP_DEV = os.getenv('WARP_DEV')
 
-
 def make_random_images(keys, shape, device=None):
   return {k: Tensor.randint(shape, low=0, high=256, dtype='uint8', device=device).realize() for k in keys}
-
 
 def warp_perspective_tinygrad(src_flat, M_inv, dst_shape, src_shape, stride_pad, border_fill_val=None):
   w_dst, h_dst = dst_shape
@@ -79,7 +77,6 @@ def warp_perspective_tinygrad(src_flat, M_inv, dst_shape, src_shape, stride_pad,
                (y_round >= 0) & (y_round <= h_src - 1)).cast(sampled.dtype)
   return sampled * in_bounds + Tensor(border_fill_val, dtype=sampled.dtype) * (1 - in_bounds)
 
-
 def frames_to_tensor(frames):
   H = (frames.shape[0] * 2) // 3
   W = frames.shape[1]
@@ -90,7 +87,6 @@ def frames_to_tensor(frames):
                        frames[H:H+H//4].reshape((H//2, W//2)),
                        frames[H+H//4:H+H//2].reshape((H//2, W//2)), dim=0).reshape((6, H//2, W//2))
   return in_img1
-
 
 def make_frame_prepare(nv12: NV12Frame, model_w, model_h):
   cam_w, cam_h, stride, y_height, uv_height, _ = nv12
@@ -117,7 +113,6 @@ def make_frame_prepare(nv12: NV12Frame, model_w, model_h):
     return tensor
   return frame_prepare_tinygrad
 
-
 def make_warp_input_queues(vision_input_shapes, frame_skip, device):
   img = vision_input_shapes['img']  # (1, 12, 128, 256)
   n_frames = img[1] // 6
@@ -134,7 +129,6 @@ def make_warp_input_queues(vision_input_shapes, frame_skip, device):
   }
   return input_queues, npy
 
-
 def get_policy_npy_shapes(input_shapes):
   dp = input_shapes['desire_pulse']  # (1, 25, 8)
   tc = input_shapes['traffic_convention']  # (1, 2)
@@ -143,7 +137,6 @@ def get_policy_npy_shapes(input_shapes):
   # TODO prev_feat shouldn't exist and be handled inside the JIT, but corrupt on QCOM for now
   shapes = {'desire': (dp[2],), 'traffic_convention': tuple(tc), 'action_t': tuple(at), 'prev_feat': (fb[0], fb[2])}
   return shapes, [math.prod(s) for s in shapes.values()]
-
 
 def make_input_queues(input_shapes, frame_skip, device):
   input_queues, npy = make_warp_input_queues(input_shapes, frame_skip, device)
@@ -162,19 +155,15 @@ def make_input_queues(input_shapes, frame_skip, device):
   })
   return input_queues, npy
 
-
 def shift_and_sample(buf, new_val, sample_fn):
   buf.assign(buf[1:].cat(new_val, dim=0).contiguous())
   return sample_fn(buf)
 
-
 def sample_skip(buf, frame_skip):
   return buf[::frame_skip].contiguous().flatten(0, 1).unsqueeze(0)
 
-
 def sample_desire(buf, frame_skip):
   return buf.reshape(-1, frame_skip, *buf.shape[1:]).max(1).flatten(0, 1).unsqueeze(0)
-
 
 def make_warp(nv12, model_w, model_h, frame_skip):
   frame_prepare = make_frame_prepare(nv12, model_w, model_h)
@@ -189,7 +178,6 @@ def make_warp(nv12, model_w, model_h, frame_skip):
     return Tensor.cat(warped_frame, warped_big_frame)
 
   return warp
-
 
 def make_run_policy(model_runner, model_metadata, frame_skip):
   sample_desire_fn = partial(sample_desire, frame_skip=frame_skip)
@@ -220,6 +208,55 @@ def make_run_policy(model_runner, model_metadata, frame_skip):
     return out,
   return run_policy
 
+def make_run_seed(frame_skip, pad_ch):
+  """DSP split, vision half (GPU): sample the img rings and stack them into the u8 seed the DSP model takes.
+
+  A concat and nothing else -- the stem lives INSIDE the fused DSP graph. That works only because the fused
+  model's seed quant is pinned to (1/128, 128) (`distill.export_vision_single --pin-seed`), making DQ(u8) ==
+  (u8-128)/128 exactly, i.e. the model's own normalisation, so the warped camera BYTES already are the seed.
+  Layout |img 12|big 12|pad `pad_ch`| matches the exporter's `stack_frames`; the pad only reaches a multiple
+  of 32 and its weights are structurally zero.
+  """
+  sample_skip_fn = partial(sample_skip, frame_skip=frame_skip)
+  def run_seed(warped, img_q, big_img_q):
+    warped = warped.to(Device.DEFAULT)
+    Tensor.realize(warped)
+    seed = shift_and_sample(img_q, warped[0:1], sample_skip_fn).cat(shift_and_sample(big_img_q, warped[1:2], sample_skip_fn), dim=1)
+    if pad_ch:
+      seed = seed.cat(Tensor.zeros(1, pad_ch, *seed.shape[2:], dtype=seed.dtype, device=seed.device), dim=1)
+    return seed.permute(0, 2, 3, 1),
+  return run_seed
+
+def make_run_policy_split(policy_runner, model_metadata, frame_skip):
+  """DSP split, policy half (GPU): make_run_policy minus the vision half -- the feature comes from the DSP as
+  `linear_80` instead of from a tower here, and prev_feat/the rings stay exactly as the fused path packs them."""
+  sample_desire_fn = partial(sample_desire, frame_skip=frame_skip)
+  sample_skip_fn = partial(sample_skip, frame_skip=frame_skip)
+  npy_shapes, npy_sizes = get_policy_npy_shapes(model_metadata['input_shapes'])
+
+  def run_policy(linear_80, feat_q, desire_q, packed_npy_inputs):
+    linear_80, packed_npy_inputs = linear_80.to(Device.DEFAULT), packed_npy_inputs.to(Device.DEFAULT)
+    Tensor.realize(linear_80, packed_npy_inputs)
+
+    desire, traffic_convention, action_t, prev_feat = (t.reshape(s) for t, s in zip(packed_npy_inputs.split(npy_sizes), npy_shapes.values(), strict=True))
+    inputs = {
+      'linear_80': linear_80,
+      'features_buffer': shift_and_sample(feat_q, prev_feat.reshape(1, 1, -1), sample_skip_fn),
+      'desire_pulse': shift_and_sample(desire_q, desire.reshape(1, 1, -1), sample_desire_fn),
+      'traffic_convention': traffic_convention,
+      'action_t': action_t,
+    }
+    out = next(iter(policy_runner(inputs).values())).cast('float32')
+    return out,
+  return run_policy
+
+def build_megakernel_dsp(dsp_onnx):
+  """ONNX -> the megakernel (.so, op list, weights, layout) as picklable plain data, NOT DSP tensors: modeld
+  realizes them onto Device["DSP"] itself."""
+  from openpilot.selfdrive.modeld.dsp.compile.build import build
+  lib, src, layout, data = build(dsp_onnx)
+  return {'lib': lib, 'src': src, 'layout': layout,
+          'wts': data["wts"].astype(np.uint8), 'oplist': data["ops"].astype(np.int32)}
 
 def compile_jit(jit, make_random_inputs, input_keys, make_queues):
   SEED = 42
@@ -266,11 +303,9 @@ def compile_jit(jit, make_random_inputs, input_keys, make_queues):
   random_inputs_run(jit, SEED+1, test_val, test_buffers, expect_match=False)
   return jit
 
-
 def _parse_size(s):
   w, h = s.lower().split('x')
   return int(w), int(h)
-
 
 def read_file_chunked_to_disk(path):
   from openpilot.common.file_chunker import open_file_chunked
@@ -280,7 +315,6 @@ def read_file_chunked_to_disk(path):
   atexit.register(lambda: os.path.exists(tmp_path) and os.remove(tmp_path))
   return tmp_path
 
-
 if __name__ == "__main__":
   from tinygrad.nn.onnx import OnnxRunner
   from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
@@ -289,9 +323,11 @@ if __name__ == "__main__":
   p.add_argument('--model-size', type=_parse_size, required=True, help='model input WxH')
   p.add_argument('--camera-resolutions', type=_parse_size, nargs='+', required=True,
                  help='camera resolutions WxH (one or more)')
-  p.add_argument('--onnx', required=True)
+  p.add_argument('--onnx', required=True, help='fused supercombo (default) or the POLICY-only onnx (--dsp)')
   p.add_argument('--output', required=True)
   p.add_argument('--frame-skip', type=int, required=True)
+  p.add_argument('--dsp', action='store_true', help='DSP split: --onnx is the policy half, --dsp-onnx the int8 vision model (stem INCLUDED)')
+  p.add_argument('--dsp-onnx', help='vision onnx, compiled here into the DSP megakernel (--dsp)')
   args = p.parse_args()
 
   model_path = read_file_chunked_to_disk(args.onnx)
@@ -299,13 +335,23 @@ if __name__ == "__main__":
 
   model_runner = OnnxRunner(model_path)
   out = {'metadata': make_metadata_dict(model_path)}
-
-  run_policy_jit = TinyJit(make_run_policy(model_runner, out['metadata'], args.frame_skip), prune=True)
-
+  if args.dsp:
+    out['dsp_mk'] = build_megakernel_dsp(read_file_chunked_to_disk(args.dsp_onnx))
+    out['metadata']['dsp'] = True
+    out['metadata']['input_shapes'].update(dict.fromkeys(('img', 'big_img'), (1, 12, model_h // 2, model_w // 2)))
   make_policy_queues = partial(make_input_queues, out['metadata']['input_shapes'], args.frame_skip)
-  make_random_model_inputs = partial(make_random_images, keys=['warped'], shape=(2, 6, *out['metadata']['input_shapes']['img'][2:]), device=WARP_DEV)
-  out['run_policy'] = compile_jit(run_policy_jit, make_random_model_inputs, POLICY_INPUTS,
-                                  make_policy_queues)
+  ishapes = out['metadata']['input_shapes']
+  if args.dsp:
+    seed_ch = out['dsp_mk']['layout'].seed_bytes // (ishapes['img'][2] * ishapes['img'][3])
+    run_seed_jit = TinyJit(make_run_seed(args.frame_skip, seed_ch - 24), prune=True)
+    make_random_seed_inputs = partial(make_random_images, keys=['warped'], shape=(2, 6, *ishapes['img'][2:]), device=WARP_DEV)
+    out['run_seed'] = compile_jit(run_seed_jit, make_random_seed_inputs, VISION_INPUTS, make_policy_queues)
+    make_random_model_inputs = lambda: {'linear_80': Tensor(Tensor.randn(*ishapes['linear_80']).numpy(), device='NPY').realize()}  # noqa: E731
+    run_policy_jit = TinyJit(make_run_policy_split(model_runner, out['metadata'], args.frame_skip), prune=True)
+  else:
+    run_policy_jit = TinyJit(make_run_policy(model_runner, out['metadata'], args.frame_skip), prune=True)
+    make_random_model_inputs = partial(make_random_images, keys=['warped'], shape=(2, 6, *ishapes['img'][2:]), device=WARP_DEV)
+  out['run_policy'] = compile_jit(run_policy_jit, make_random_model_inputs, POLICY_SPLIT_INPUTS if args.dsp else POLICY_INPUTS, make_policy_queues)
 
   for cam_w, cam_h in args.camera_resolutions:
     nv12 = NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
