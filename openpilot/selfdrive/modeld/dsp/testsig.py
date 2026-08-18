@@ -14,6 +14,7 @@ import tempfile
 SERIAL_PATH = "/sys/devices/soc0/serial_number"
 CDSP_DIR = "/dsp/cdsp"
 
+
 def _load_sign():
   """Import _sign from the tinygrad submodule's generator (extra/testsig has no __init__, so load by path).
   Walk up from this file to the openpilot repo root that contains tinygrad_repo/ (host or device checkout)."""
@@ -28,14 +29,17 @@ def _load_sign():
     d = os.path.dirname(d)
   raise FileNotFoundError("tinygrad_repo/extra/testsig/generate_testsig.py not found")
 
+
 def _serial():
   with open(SERIAL_PATH) as f:
     return int(f.read().strip(), 0)
+
 
 def testsig_path(serial=None):
   if serial is None:
     serial = _serial()
   return os.path.join(CDSP_DIR, f"testsig-0x{serial:08x}.so")
+
 
 def _cwd_symlink(dst, serial):
   """tinygrad's DSP RPCListener stats the testsig by a RELATIVE name resolved against the process CWD, so a
@@ -48,6 +52,7 @@ def _cwd_symlink(dst, serial):
       os.symlink(dst, link)
   except OSError as e:
     print(f"[testsig] could not create CWD symlink {link} ({e}); open_lib may need it")
+
 
 def ensure_testsig():
   """Return True if the testsig is present (installing it if missing). Non-fatal: returns False and logs on
@@ -64,13 +69,14 @@ def ensure_testsig():
   print(f"[testsig] {dst} missing (wiped on reboot?) — generating + installing")
   _sign = _load_sign()
   with tempfile.TemporaryDirectory() as td:
-    src = _sign(serial, td)
+    src = _sign(serial, td)  # writes testsig-0x<serial>.so into td
     os.chmod(td, 0o755)
-    os.chmod(src, 0o644)
+    os.chmod(src, 0o644)  # tempdir is 0700 -> make root-readable for the sudo cp
+    # /dsp is a read-only mount, /dsp/cdsp is root-owned; remount rw + cp as ROOT, then remount ro.
     sudo = [] if os.geteuid() == 0 else ["sudo", "-n"]
     try:
       subprocess.run(sudo + ["mount", "-o", "remount,rw", "/dsp"], check=True)
-      subprocess.run(sudo + ["cp", src, dst], check=True)
+      subprocess.run(sudo + ["cp", src, dst], check=True)  # cp as root (dir is root-owned)
       subprocess.run(sudo + ["chmod", "644", dst], check=False)
     except (subprocess.CalledProcessError, PermissionError, OSError) as e:
       print(f"[testsig] install FAILED ({e}); provision manually: sudo mount -o remount,rw /dsp && sudo cp {src} {dst} && sudo mount -o remount,ro /dsp")
@@ -82,6 +88,7 @@ def ensure_testsig():
   if ok:
     _cwd_symlink(dst, serial)
   return ok
+
 
 if __name__ == "__main__":
   print("testsig present:", ensure_testsig())

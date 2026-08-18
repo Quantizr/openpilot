@@ -31,11 +31,13 @@ from openpilot.selfdrive.modeld.dsp.compile import lower, parse
 
 HERE = pathlib.Path(__file__).parent
 
-_ASM_FILES = (
+
+_ASM_FILES = (   # exactly the kernels megakernel.c references; lib/ holds more
   "gvconv2dbbb_circ_d32_v65_h.S", "gvconv2dbbb_circ_d64_v65_h.S", "repstream2_h.S",
   "to_d32_h.S", "from_d32_h.S",
   "dwconv2dbbb_s1_3x3_h.S", "dwconv2dbbb_s1_5xN_h.S", "dwconv2dbbb_s1_7xN_h.S",
   "dwconv2dbbb_s2_3x3_h.S", "dwconv2dbbb_s2_5xN_h.S")
+
 
 def compile_megakernel(layout: MegakernelLayout, tune_defines: list[str] | None = None) -> tuple[str, bytes]:
   """Cross-compile megakernel.c (+ the vendored HVX asm) to a Hexagon .so; returns (src_with_defines, lib_bytes).
@@ -51,7 +53,14 @@ def compile_megakernel(layout: MegakernelLayout, tune_defines: list[str] | None 
   if getenv("PROF_OPS"):
     args += " -DPROF_OPS=1"
   if os.getenv("EXTRA_DEFS"):
-    args += " " + os.getenv("EXTRA_DEFS")
+    args += " " + os.getenv("EXTRA_DEFS")   # ad-hoc A/B knobs for a one-off measurement -- test only
+  # ★ CACHE THE .so. Since C4b the binary is MODEL-INDEPENDENT -- every case compiles the identical thing, so a
+  # verify run paid ~2.7s of clang eight times over. Keyed on everything that reaches the compiler: the C source,
+  # the vendored .S, and the full argument string (so EXTRA_DEFS / PROF_OPS / a tuning still recompile).
+  #
+  # It also makes the build REPRODUCIBLE, which matters beyond speed: the Hexagon clang is not deterministic, so
+  # identical source produced a differently-scheduled binary every run and the sub-millisecond probes drifted a
+  # few percent between builds for no reason. One cached .so per source state removes that from the gate.
   _asm_paths = [HERE / "lib" / f for f in _ASM_FILES]
   _h = hashlib.sha256((HERE / "megakernel.c").read_bytes())
   for _a in _asm_paths: _h.update(pathlib.Path(_a).read_bytes())
@@ -76,7 +85,9 @@ def compile_megakernel(layout: MegakernelLayout, tune_defines: list[str] | None 
   diskcache_put("dsp_megakernel_so", _ck, lib)
   return src, lib
 
+
 def _ru(x, m): return (x + m - 1) // m * m
+
 
 def scratch_layout(ops):
   """128-aligned offsets of the 3 conv-scratch regions packed into one buffer, sized to the max over every conv
@@ -98,8 +109,13 @@ def scratch_layout(ops):
   off, cur = {}, 0
   for name in ("d32in", "d32out", "minmax"):
     off[name] = cur
+    # ⚠ THE +8192 IS A GUARD BAND, NOT A LICENCE. It is why the `gqtab` overrun corrupted memory SILENTLY at
+    # C=640 (+1 KB, absorbed) and only faulted the PD at C=768 (+2 KB, still absorbed here -- it was the STACK
+    # copy that faulted). An under-declared `scratch=` up to 8 KB will not show up as a crash; it will show up
+    # as a wrong answer in the next region. Declare the real size.
     cur = _ru(cur + sizes[name] + 8192, 128)
   return off, cur
+
 
 def _lifetime_offsets(p, prog):
   """Assign arena offsets by TENSOR LIFETIME instead of bump-allocating, so a tensor's space is reused once its
@@ -111,13 +127,14 @@ def _lifetime_offsets(p, prog):
   outlive the schedule (the seed, the output, the shared scratch regions) are pinned by never being freed."""
   from tinygrad.runtime.support.memory import TLSFAllocator
   ops, sizes = p["op_list"], p["alloc_sizes"]
-  live = {n: [len(ops), -1] for n in sizes}
+  live = {n: [len(ops), -1] for n in sizes}                      # name -> [first use, last use]
   for i, o in enumerate(ops):
-    for key in lower._ROLES + ("out",):
+    for key in lower._ROLES + ("out",):   # every field by which an op names a tensor
       nm = getattr(o, key, None)
       if isinstance(nm, str) and nm in live:
         live[nm][0] = min(live[nm][0], i)
         live[nm][1] = max(live[nm][1], i)
+  # anything the op list does not mention (seed, scratch pools, the bordered buffers) stays live for the whole run
   for n in sizes:
     if live[n][1] < 0: live[n] = [0, len(ops)]
   al = TLSFAllocator(sum(sizes.values()) * 2, block_size=128)
@@ -129,6 +146,7 @@ def _lifetime_offsets(p, prog):
         offs[n] = al.alloc(sizes[n], 128)
         freeing.setdefault(live[n][1] + 1, []).append(n)
   return offs
+
 
 def ensure_mult32_seed(onnx_path, mult=32):
   """★ A GRAPH INPUT WHOSE CHANNEL COUNT IS NOT A MULTIPLE OF 32 IS SILENTLY WRONG. Zero-pad it here.
@@ -154,6 +172,10 @@ def ensure_mult32_seed(onnx_path, mult=32):
   (12->32 is 2.67x the bytes over FastRPC), which is exactly why OP_INCONV exists for small Cin. Padding is
   the CORRECT GENERAL fix; INCONV is the fast path.
   """
+  # ⚠ Read the channel count with TINYGRAD's vendored parser, and import the `onnx` package only in the branch
+  # that actually rewrites the graph. The DSP build is deliberately onnx-free so it runs in the on-device venv
+  # (onnx is the one lib missing there); an unconditional `import onnx` here broke the device build even though
+  # every model we ship is already mult-32 and never reaches the padding path.
   from tinygrad.nn.onnx import OnnxPBParser
   _g = OnnxPBParser(pathlib.Path(onnx_path)).parse()["graph"]
   _produced = {o for n in _g["node"] for o in n["output"]}
@@ -174,7 +196,7 @@ def ensure_mult32_seed(onnx_path, mult=32):
   dq = next((n for n in g.node if n.op_type == "DequantizeLinear" and gin in n.input), None)
   conv = next((n for n in g.node if dq is not None and dq.output[0] in n.input and n.op_type == "Conv"), None)
   if conv is None:
-    return onnx_path
+    return onnx_path                       # not a shape this transform understands; leave it alone
   wdq = next((n for n in g.node if n.output and n.output[0] == conv.input[1]), None)
   wname = wdq.input[0] if wdq is not None else conv.input[1]
   init = {i.name: i for i in g.initializer}
@@ -183,6 +205,10 @@ def ensure_mult32_seed(onnx_path, mult=32):
   w = _nh.to_array(init[wname])
   if w.shape[1] != Cin:
     return onnx_path
+  # ★ DO NOT PAD A SEED THAT OP_INCONV CAN READ NATIVELY. The pixels-in-lanes stem takes NHWC with Cin<=4
+  # directly (parse.py:669 -- groups==1, Cin<=4, 3x3, s2, Cout<=32) and is the whole reason MobileNetV2 went
+  # 49.5 -> 36.9 ms. Padding 3 -> 32 is CORRECT but would silently route it down the dense CONV path at ~10x
+  # the input bytes. Padding exists for the shapes INCONV refuses; this is not one of them.
   attr = {a.name: a for a in conv.attribute}
   ks = list(attr["kernel_shape"].ints) if "kernel_shape" in attr else []
   st = list(attr["strides"].ints) if "strides" in attr else [1, 1]
@@ -199,6 +225,7 @@ def ensure_mult32_seed(onnx_path, mult=32):
         flush=True)
   return out
 
+
 def build(onnx):
   """HOST or DEVICE: ONNX -> (lib, src, layout, data). The backbone takes the u8 seed directly (the stem's graph
   quantizes it), so nothing here has to describe the seed quant to the caller. Pure codegen -- the model is never
@@ -206,12 +233,16 @@ def build(onnx):
   onnx = ensure_mult32_seed(onnx)
   prog = parse.extract(onnx)
   p = lower.build_program(prog)
-  if not getenv("NO_ARENA_REUSE"):
+  if not getenv("NO_ARENA_REUSE"):   # pass 2: re-emit with lifetime-assigned offsets (see _lifetime_offsets)
     p = lower.build_program(prog, _preassigned=_lifetime_offsets(p, prog))
   ops = np.asarray(p["ops"]).reshape(-1, lower.INTS_PER_OP)
   seed_off, sshape = p["seed"]
   out_off, out_sz = p["out"]
   soff, scratch_bytes = scratch_layout(ops)
+  # The terminal's ELEMENT SIZE: a HEAD emits float, every other terminal (a conv/dw/add, i.e. any MK_TRUNC debug
+  # build) emits u8. Assuming float unconditionally made the runner copy 4x the real output out of the arena, which
+  # faults (rc=39) on any graph whose output sits near the end of a small arena -- it only ever "worked" on models
+  # big enough that the overread stayed inside the arena. Round u8 up to 4: megakernel() views the output as float32.
   out_bytes = int(out_sz) * 4 if p["out_f32"] else (int(out_sz) + 3) // 4 * 4
   layout = MegakernelLayout(seed_off=int(seed_off), seed_bytes=int(np.prod(sshape)),
                             out_off=int(out_off), out_bytes=out_bytes, nops=len(ops),
@@ -219,11 +250,14 @@ def build(onnx):
                             minmax_off=soff["minmax"], arena_size=int(p["arena_size"]),
                             scratch_bytes=scratch_bytes)
   src, lib = compile_megakernel(layout)
+  # Prepend the per-model header record: the kernel reads its layout from here rather than from -D defines, which
+  # is what makes the .so model-independent (build once, swap models as pure data).
   hdr = np.zeros((1, lower.INTS_PER_OP), np.int32)
   hdr[0, :len(layout.header())] = layout.header()
   data = dict(wts=np.frombuffer(p["wts"], np.uint8).copy(),
               ops=np.concatenate([hdr, ops]).reshape(-1).astype(np.int32))
   return lib, src, layout, data
+
 
 def _golden_cached(onnx: str, prog, seed_u8):
   """The oracle is BY FAR the slowest thing here -- MEASURED 209.6s for distill (817 nodes) -- and it depends on
@@ -247,7 +281,7 @@ def _golden_cached(onnx: str, prog, seed_u8):
   h = hashlib.sha256(pathlib.Path(onnx).read_bytes())
   h.update(seed_u8.tobytes())
   h.update(pathlib.Path(_tgonnx.__file__).read_bytes())
-  h.update(inspect.getsource(golden).encode())
+  h.update(inspect.getsource(golden).encode())   # so editing the oracle itself invalidates too
   k = h.hexdigest()[:32]
   outs = diskcache_get("dsp_golden_ops", k)
   if outs is None:
@@ -257,20 +291,22 @@ def _golden_cached(onnx: str, prog, seed_u8):
   v = outs[_oplist(prog)[-1].out]
   return nhwc(v[0] if v.ndim == 4 else v).reshape(-1).astype(np.float32)
 
+
 def build_to_pkl(onnx, path):
   """Build + bake a random seed and its numpy golden, so `run`/`jit` below can check the device against numpy.
   The golden is for THIS CLI only -- a scons build calls build() and never runs the replica."""
   import pickle
   import dataclasses
-  onnx = ensure_mult32_seed(onnx)
+  onnx = ensure_mult32_seed(onnx)     # BEFORE the golden, so oracle and device see the SAME model
   lib, src, layout, data = build(onnx)
-  prog = parse.extract(onnx)
+  prog = parse.extract(onnx)          # memoised -- build() already parsed this exact file
   seed = np.random.default_rng(42).integers(0, 256, prog["seed_shape"], dtype=np.uint8)
   emb = _golden_cached(onnx, prog, seed)
   data = dict(data, seed=nhwc(seed).astype(np.uint8))
   with open(path, "wb") as f:
     pickle.dump(dict(lib=lib, src=src, layout=dataclasses.asdict(layout), data=data, emb=emb), f)
   print(f"built {path}: lib {len(lib)} B, {layout.nops} ops, arena {layout.arena_size/1e6:.2f}MB, scratch {layout.scratch_bytes/1e6:.2f}MB")
+
 
 def verify_pkl(path, iters=30):
   """DEVICE: run the backbone and check it against the golden baked into the pkl by `build`.
@@ -299,7 +335,7 @@ def verify_pkl(path, iters=30):
   def f(s):
     return megakernel(s, wts, oplist, d["lib"], d["src"], layout).realize()
 
-  for _ in range(4):
+  for _ in range(4):   # warmup + JIT capture
     f(seed)
     Device["DSP"].synchronize()
   us = []
@@ -307,11 +343,35 @@ def verify_pkl(path, iters=30):
     out = f(seed)
     Device["DSP"].synchronize()
     us.append(Device["DSP"].last_kernel_us)
+  # ★ A HEAD emits float32; EVERY other terminal (conv/dw/add -- i.e. any MK_TRUNC debug build) emits u8, while
+  # megakernel() always views the output buffer as float32. Reinterpret when the golden is longer than the float
+  # view, or the comparison is u8 bytes read as floats: MK_TRUNC has been silently producing meaningless cosines
+  # (chain_dws1 read 0.2198 for a kernel that is fine). build.py:161 sized the buffer correctly; nothing fixed the
+  # READ. This is the primary per-op debugging tool, so it being broken hid every use of it.
   raw = out.numpy()
   got = np.asarray(raw.view(np.uint8) if len(emb) > raw.size else raw, np.float64).ravel()[:len(emb)]
   cos = float(got @ emb / (np.linalg.norm(got) * np.linalg.norm(emb) + 1e-12))
   print(f"cosine vs OnnxRunner golden {cos:.7f} | on-DSP median {statistics.median(us) / 1e3:.3f} ms (N={iters})")
   return cos
+
+
+# ---- AUTOTUNE: DELETED 2026-07-26, after it was run and measured. ----------------------------------------------
+# ~90 lines swept nine kernel constants per model on the device (coordinate descent, diskcache-cached, keyed on the
+# model bytes + the sources that decide what the constants do) so a third architecture would not silently inherit
+# distill's and MobileNetV2's hand-tuned values. It was run on both models and found NOTHING: every knob came back
+# "noise, keep default". Part of the reason is now visible -- three of the seven knobs it swept could not have moved
+# anything. CONV_TH and WT_PREFETCH were #defines megakernel.c never referenced, so three candidate values compiled
+# to the same kernel; NT_LOADS had already been settled null by a within-run measurement. The rest are genuinely at
+# their optimum (V65_WT_BUDGET was re-swept by hand as recently as 2026-07-25).
+# The mechanism was sound and the result is the point: THESE CONSTANTS DO NOT NEED PER-MODEL TUNING, and a sweeper
+# that has to be kept in step with a KEYED_SOURCES list is a maintenance liability against a measured null. If a
+# future architecture does regress, sweep it by hand with floors.ab (which now cancels the placement bias) before
+# rebuilding any of this.
+
+# ====================================================================================================================
+# THE GOLDEN -- the original QDQ ONNX under tinygrad's OnnxRunner
+# was: reference.py
+# ====================================================================================================================
 
 """The golden the device is checked against: the ORIGINAL QDQ ONNX, run by tinygrad's OnnxRunner on CPU.
 
@@ -343,11 +403,13 @@ def _oplist(prog):
   """The op list exactly as build_program sees it, including MK_TRUNC truncation. The last op's `out` names the
   tensor the device will produce, which is what the golden must be taken from."""
   ops = parse.emit(prog)[0]
-  if os.environ.get("MK_TRUNC"):
+  if os.environ.get("MK_TRUNC"):   # DEBUG: match build_program's op truncation so the golden is op[N-1]'s tensor
     ops = ops[:int(os.environ["MK_TRUNC"])]
   return ops
 
+
 _ORACLE_CACHE: dict = {}
+
 
 def onnx_arena(prog, seed_u8):
   """The ORIGINAL QDQ ONNX under tinygrad's OnnxRunner on CPU -> {tensor name: numpy}, every intermediate.
@@ -355,6 +417,12 @@ def onnx_arena(prog, seed_u8):
   Every op we emit is named for the ONNX tensor it produces, so `arena[op["out"]]` works for truncated builds too;
   OnnxRunner also takes `limit=N` to stop at node N, which is MK_TRUNC's semantics if we ever want it. CPU rather
   than the host default (NV) so the result is deterministic and driver-independent."""
+  # ★ STAMPED ON (mtime, size), NOT THE PATH ALONE. Keying on the path meant that writing a DIFFERENT model to a
+  # path this process had already oracled returned the FIRST model's intermediates -- and _golden_cached then
+  # persisted them to disk under the second model's (correctly content-hashed) key, so the poison outlived the
+  # process and every later run read a golden belonging to another graph. Caught by a block sweep: a 5-conv chain
+  # scored cosine 0.036 while an independent numpy head put the DEVICE at 0.9999785, i.e. the gate was wrong and
+  # the kernel was right. `parse.extract` right above already stamps for exactly this reason; this did not.
   st = pathlib.Path(prog["path"]).stat()
   key = (prog["path"], st.st_mtime_ns, st.st_size, seed_u8.tobytes())
   if key not in _ORACLE_CACHE:
@@ -368,18 +436,21 @@ def onnx_arena(prog, seed_u8):
         raise ValueError(f"{prog['path']}: graph input {name} has a non-positive dim {spec.shape} -- a dynamic "
                          f"batch exported as dim_value 0. Fix the model (set it to 1); do not paper over it.")
       r({name: Tensor(seed_u8.reshape([1] + list(prog["seed_shape"])))})
-    _ORACLE_CACHE.clear()
+    _ORACLE_CACHE.clear()   # one model at a time; a big model's intermediates are not worth holding
     _ORACLE_CACHE[key] = {k: v.numpy() for k, v in r.graph_values.items() if v is not None and hasattr(v, "numpy")}
   return _ORACLE_CACHE[key]
+
 
 def golden(prog, seed_u8):
   """The expected feature for a given u8 seed. Uncached -- callers want _golden_cached."""
   v = onnx_arena(prog, seed_u8)[_oplist(prog)[-1].out]
-  return nhwc(v[0] if v.ndim == 4 else v).reshape(-1).astype(np.float32)
+  return nhwc(v[0] if v.ndim == 4 else v).reshape(-1).astype(np.float32)   # drop batch; NHWC matches the device arena
+
 
 def nhwc(v):
   """spatial [C,H,W] -> [H,W,C] (the on-device arena layout); scalars/vectors pass through."""
   return v.transpose(1, 2, 0).copy() if v.ndim == 3 else v
+
 
 if __name__ == "__main__":
   cmd = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -387,8 +458,8 @@ if __name__ == "__main__":
     build_to_pkl(os.path.abspath(sys.argv[2]), sys.argv[3])
   elif cmd == "verify" and len(sys.argv) >= 3:
     src = sys.argv[2]
-    if src.endswith(".onnx"):
-      import tempfile
+    if src.endswith(".onnx"):   # convenience: build it here first. On the DEVICE that pays OnnxRunner on the CPU
+      import tempfile           # (63s of distill's 86s) -- prefer `build` on the host, scp the pkl, `verify` here.
       pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False).name
       build_to_pkl(os.path.abspath(src), pkl)
       src = pkl

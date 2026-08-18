@@ -16,7 +16,7 @@ from tinygrad import Tensor, dtypes
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.renderer import Estimates
 
-CORNER = 6
+CORNER = 6  # HAP_DCVS_VCORNER: TURBO
 
 @dataclass(frozen=True)
 class MegakernelLayout:
@@ -42,6 +42,7 @@ class MegakernelLayout:
     return [self.nops, self.seed_off, self.seed_bytes, self.out_off, self.out_bytes,
             self.d32in, self.d32out, self.minmax_off]
 
+
 @functools.cache
 def _scratch(dev:str, layout:MegakernelLayout) -> tuple[Tensor, Tensor, Tensor]:
   """The kernel's own buffers (feature out, activation arena, conv scratch), allocated once per (device, model).
@@ -53,6 +54,7 @@ def _scratch(dev:str, layout:MegakernelLayout) -> tuple[Tensor, Tensor, Tensor]:
   return (Tensor.empty(layout.out_bytes // 4, dtype=dtypes.float32, device=dev),
           Tensor.empty(layout.arena_size + 128, dtype=dtypes.uint8, device=dev),
           Tensor.empty(layout.scratch_bytes, dtype=dtypes.uint8, device=dev))
+
 
 def megakernel(seed: Tensor, wts: Tensor, oplist: Tensor, lib: bytes, src: str, layout: MegakernelLayout) -> Tensor:
   """Run the whole backbone as ONE Tensor.custom_kernel on Device["DSP"]. Returns the feature Tensor.

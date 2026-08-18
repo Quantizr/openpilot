@@ -40,6 +40,7 @@ LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
 BIG_MODEL_TIMEOUT = 60
 
+
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
                           lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
   if 'action' not in model_output:
@@ -66,6 +67,7 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
   return log.ModelDataV2.Action(desiredCurvature=float(desired_curvature),
                                 desiredAcceleration=float(desired_accel),
                                 shouldStop=bool(stop))
+
 
 class ChestnutState:
   # only modeld can access chestnut
@@ -121,6 +123,7 @@ class ChestnutState:
     msg.valid = asm_valid and (not self.big or self.valid)
     self.pm.send('chestnutState', msg)
 
+
 class FrameMeta:
   frame_id: int = 0
   timestamp_sof: int = 0
@@ -129,6 +132,7 @@ class FrameMeta:
   def __init__(self, vipc=None):
     if vipc is not None:
       self.frame_id, self.timestamp_sof, self.timestamp_eof = vipc.frame_id, vipc.timestamp_sof, vipc.timestamp_eof
+
 
 class DSPVision:
   """The whole int8 vision student (stem included) as ONE megakernel invoke on the Hexagon, run inline in the
@@ -140,13 +144,20 @@ class DSPVision:
     wts = Tensor(np.ascontiguousarray(mk['wts'], np.uint8), device="DSP").realize()
     ops = Tensor(np.ascontiguousarray(mk['oplist'], np.int32), device="DSP").realize()
     n = mk['layout'].seed_bytes
+    # Resident seed, written straight into its ion mapping: a DSP buffer is host-mapped, so the frame's 1MB costs
+    # one memcpy and no allocation (a fresh Tensor per frame is ~2ms against ~0.1ms).
     self.seed = Tensor(np.zeros(n, np.uint8), device="DSP").contiguous().realize()
     self.seed_mv = np.asarray(self.seed.uop.buffer.as_memoryview(force_zero_copy=True))
+    # ⚠ seed.numpy() reads an UNCACHED write-combine mapping at ~275MB/s -- 4.4ms for 1MB, an eighth of the
+    # frame. A WRITEBACK staging buffer reads it in 0.11ms, but the jit cannot write one directly (see
+    # make_run_seed) and staging it separately costs 3.4ms of dispatch to save 4.4ms of read. Not worth 19 lines
+    # of private allocator API for 0.9ms; revisit if tinygrad ever rebinds external jit inputs.
     self.run = TinyJit(lambda s: megakernel(s, wts, ops, mk['lib'], mk['src'], mk['layout']).realize())
 
   def __call__(self, seed_np: np.ndarray) -> np.ndarray:
     self.seed_mv[:] = seed_np.reshape(-1)
     return self.run(self.seed).numpy().reshape(-1).astype(np.float32)
+
 
 class ModelState:
   prev_desire: np.ndarray  # for tracking the rising edge of the pulse
@@ -174,6 +185,8 @@ class ModelState:
 
     self.dsp = metadata.get('dsp', False)
     if self.dsp:
+      # the GPU stacks the warped frames into a u8 seed and the vision model runs on the Hexagon; testsig is what
+      # lets the cDSP load unsigned code. Everything else -- the rings, prev_feat, run_policy -- is the fused path.
       from openpilot.selfdrive.modeld.dsp.testsig import ensure_testsig
       ensure_testsig()
       self.run_seed, self.vision = jits['run_seed'], DSPVision(jits['dsp_mk'])
@@ -234,6 +247,7 @@ class ModelState:
     self.prev_desire[:] = 0
     self.full_frames.clear()
     self._blob_cache.clear()
+
 
 def main(demo=False):
   cloudlog.warning("modeld init")
@@ -454,6 +468,7 @@ def main(demo=False):
 
     if chestnut_state is not None and run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0:
       chestnut_state.send()
+
 
 if __name__ == "__main__":
   try:
