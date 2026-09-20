@@ -135,6 +135,19 @@ for usbgpu in [False, True] if USBGPU else [False]:
   if usbgpu:
     lenv.SideEffect(usbgpu_lock, node)
 
+# ★ LITTLE CINQUE: the composed model (v21c vision + cinque policy), built under its OWN name so it
+# never overwrites the llb v3 pkl, and guarded on the onnx being present so this branch still builds
+# without it. Its own warps live inside the pkl; the dm model and the stock warps above are untouched.
+lc_onnx = File("models/little_cinque_fp32_slim.onnx").abspath
+if os.path.exists(lc_onnx):
+  lc_pkl = File("models/little_cinque_tinygrad.pkl").abspath
+  lc_cmd = (f'{tg_flags} WARP_DEV={tg_backend} {mac_brew_string} {taskset}python3 '
+            f'{modeld_dir}/compile_little_cinque.py --onnx {lc_onnx} '
+            f'--model-size {model_w}x{model_h} --camera-resolutions {" ".join(f"{w}x{h}" for w, h in CAMERA_CONFIGS)} '
+            f'--output {lc_pkl}')
+  lenv.Command(lc_pkl, tinygrad_files + [File(f"{modeld_dir}/compile_little_cinque.py"), lc_onnx, Value(lc_cmd)],
+               Action(lc_cmd, "  [CINQUE] $TARGET"))
+
 # get model metadata
 fn = File(f"models/dmonitoring_model").abspath
 script_files = [File(Dir("#openpilot/selfdrive/modeld").File("get_model_metadata.py").abspath)]

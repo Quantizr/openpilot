@@ -27,10 +27,22 @@ from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, should_stop, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, WARP_INPUTS, POLICY_INPUTS, VISION_INPUTS, POLICY_SPLIT_INPUTS
+from openpilot.selfdrive.modeld import lowfreq, lowfreq_state
+
+# ★ LITTLE CINQUE: the composed model (distilled v21c vision + cinque policy) costs ~120 ms of Adreno
+# time, so it runs once every RUN_EVERY camera frames (5 Hz) while modeld keeps PUBLISHING at 20 Hz. On
+# the three frames in between the last prediction is AGED forward (lowfreq.age) rather than repeated:
+# repeating would freeze the plan for 200 ms and then step, which the controller reads as a jump in
+# desired curvature.
+RUN_EVERY = int(os.getenv('MODEL_RUN_EVERY', '4'))
+# The model is PIPELINED: a dispatch is collected RUN_EVERY frames later, so every result has spent this
+# long in flight before it can be published. It is a constant, so it belongs in the actuator delay.
+PIPELINE_DELAY = RUN_EVERY * DT_MDL
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.common.file_chunker import open_file_chunked
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_compiled, modeld_pkl_path, get_tg_input_devices, load_oob
+from openpilot.selfdrive.modeld.helpers import (usbgpu_present, usbgpu_compiled, modeld_pkl_path, get_tg_input_devices,
+                                                load_oob, MODELS_DIR)
 
 PROCESS_NAME = "openpilot.selfdrive.modeld.modeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
@@ -249,6 +261,121 @@ class ModelState:
     self._blob_cache.clear()
 
 
+
+LC_PKL = MODELS_DIR / 'little_cinque_tinygrad.pkl'
+
+
+def lc_active() -> bool:
+  """Is the little-cinque pkl present and enabled? LITTLE_CINQUE=0 forces the stock model."""
+  return os.getenv('LITTLE_CINQUE', '1') not in ('', '0') and LC_PKL.is_file()
+
+
+class CinqueModelState:
+  """ModelState for the composed cinque model, run at 5 Hz with 20 Hz queues.
+
+  ★ A SEPARATE CLASS, NOT A FLAG ON ModelState. ModelState is built around the old contract -- queues
+  (`img_q`/`feat_q`/`desire_q`) shifted INSIDE the JIT by `make_input_queues` + `shift_and_sample`, one
+  model call per camera frame. cinque v3 carries its queues as MODEL I/O and we deliberately keep them
+  outside the JIT so they can tick at 20 Hz while the tower runs at 5. Threading both contracts through
+  one class would put a branch in every method and risk the llb v3 path that still ships.
+  """
+
+  def __init__(self, cam_w: int, cam_h: int):
+    input_devices = get_tg_input_devices(PROCESS_NAME, False)
+    self.WARP_DEV, self.QUEUE_DEV = input_devices['WARP_DEV'], input_devices['QUEUE_DEV']
+    with open(LC_PKL, 'rb') as f:
+      jits = load_oob(f)
+    metadata = jits['metadata']
+    self.input_shapes = metadata['input_shapes']
+    self.output_slices = metadata['output_slices']
+    spec = self.spec = metadata['input_specs']
+    self.vision_input_names = ['img', 'big_img']
+    self.usbgpu = False
+
+    from openpilot.selfdrive.modeld.compile_little_cinque import make_cinque_queues, STATE_INPUTS, MODEL_INPUTS
+    self.STATE_INPUTS, self.MODEL_INPUTS = STATE_INPUTS, MODEL_INPUTS
+    self.input_queues, self.npy = make_cinque_queues(spec, device=self.QUEUE_DEV)
+    self.run_policy, self.warp = jits['run_policy'], jits[(cam_w, cam_h)]
+    self.frame_buf_params = {k: get_nv12_info(cam_w, cam_h) for k in self.vision_input_names}
+    self.full_frames: dict[str, Tensor] = {}
+    self._blob_cache: dict[tuple[str, int], Tensor] = {}
+    self.parser = Parser()
+    # at 5 Hz the model's own next_state_* would give a 200 ms motion cue, 800 ms desire windows and a
+    # 1.25 Hz feature history. LowFreqState keeps all three on their native 20 Hz cadence.
+    self.lowfreq = lowfreq_state.LowFreqState({n: spec[n] for n in STATE_INPUTS}, RUN_EVERY)
+    self.hidden_slice = self.output_slices.get('hidden_state')
+    self.pending = False   # a dispatch is in flight on the GPU, awaiting collect()
+
+  def _blobs(self, bufs):
+    for key in bufs:
+      ptr = np.frombuffer(bufs[key].data, dtype=np.uint8).ctypes.data
+      cache_key = (key, ptr)
+      if cache_key not in self._blob_cache:   # camerad hands out a ring of buffers; cache a view per address
+        self._blob_cache[cache_key] = Tensor.from_blob(ptr, (self.frame_buf_params[key][3],),
+                                                       dtype='uint8', device=self.WARP_DEV)
+      self.full_frames[key] = self._blob_cache[cache_key]
+
+  def warp_frame(self, bufs, transforms, desire_pulse):
+    """Warp ONE camera frame and tick the 20 Hz queues. Called on EVERY frame, including the three
+    between model runs -- the warp costs ~2 ms, the tower is what costs, and skipping the warp is what
+    would leave the 2-frame motion cue 200 ms wide instead of 50."""
+    self._blobs(bufs)
+    self.npy['tfm'][:, :] = transforms['img']
+    self.npy['big_tfm'][:, :] = transforms['big_img']
+    warped = self.warp(**{k: self.input_queues[k] for k in WARP_INPUTS},
+                       frame=self.full_frames['img'], big_frame=self.full_frames['big_img'])
+    self.lowfreq.tick_frame(warped.numpy(), desire_pulse)
+    return warped
+
+  def slice_outputs(self, model_outputs, output_slices):
+    return {k: model_outputs[np.newaxis, v] for k, v in output_slices.items()}
+
+  def run(self, inputs, defer: bool = True):
+    """Dispatch one model run from the queues LowFreqState has been ticking."""
+    # Desire's rising edge is detected in LowFreqState, every camera frame -- a detector here would only
+    # advance on run frames, missing pulses fired in between and re-firing ones already consumed.
+    self.npy['desire'][:] = self.lowfreq.current_desire()
+    self.npy['traffic_convention'][:] = inputs['traffic_convention']
+    self.npy['action_t'][:] = inputs['action_t']
+    for name, q in self.lowfreq.feed().items():
+      self.input_queues[name].assign(Tensor(q, device=self.QUEUE_DEV)).realize()
+    # `new_img` is the CURRENT frame; state_img_q[:, -1] holds the one 50 ms earlier.
+    warped = Tensor(self.lowfreq.newest_frame(), device=self.WARP_DEV).realize()
+    self.outs = self.run_policy(warped=warped, **{k: self.input_queues[k] for k in self.MODEL_INPUTS})
+    self.pending = True
+    return None if defer else self.collect()
+
+  def collect(self):
+    """Await the dispatch from RUN_EVERY frames ago and parse it.
+
+    ★ The kernels were enqueued, NOT awaited: reading .numpy() at dispatch would block the 20 Hz loop
+    for the model's whole ~120 ms, which is the thing running at 5 Hz exists to avoid."""
+    if not self.pending:
+      return None
+    self.pending = False
+    model_output = self.outs[0].numpy()[0]
+    if self.hidden_slice is not None:
+      self.lowfreq.absorb(model_output[self.hidden_slice])
+    outputs_dict = self.parser.parse_outputs(self.slice_outputs(model_output, self.output_slices))
+    if SEND_RAW_PRED:
+      outputs_dict['raw_pred'] = model_output.copy()
+    return outputs_dict
+
+  def warmup(self) -> None:
+    dummy = {k: np.zeros(self.frame_buf_params[k][3], dtype=np.uint8) for k in self.vision_input_names}
+    eye = np.eye(3, dtype=np.float32)
+    zeros = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
+    for _ in range(2):   # two frames so state_img_q[:, -1] is populated before the model ever runs
+      self.warp_frame(dummy, dict.fromkeys(self.vision_input_names, eye), zeros)
+    self.run({'traffic_convention': np.zeros(2, dtype=np.float32),
+              'action_t': np.zeros(2, dtype=np.float32)}, defer=False)
+    # a fresh LowFreqState: warmup fed it two dummy black frames and one feature, none of which should
+    # survive into the first real prediction.
+    self.lowfreq = lowfreq_state.LowFreqState({n: self.spec[n] for n in self.STATE_INPUTS}, RUN_EVERY)
+    self.full_frames.clear()
+    self._blob_cache.clear()
+
+
 def main(demo=False):
   cloudlog.warning("modeld init")
 
@@ -303,7 +430,12 @@ def main(demo=False):
     model = big_model
     params.put_bool("UsbGpuActive", model is not None)
 
-  small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if model is None or USBGPU else None
+  if lc_active():
+    # the composed cinque model replaces both arms: it is the only thing this branch's 5 Hz loop runs.
+    model = small_model = CinqueModelState(vipc_client_main.width, vipc_client_main.height)
+    cloudlog.warning("little cinque model active")
+  else:
+    small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if model is None or USBGPU else None
   if model is None:
     model = small_model
   params.put_bool("UsbGpuLoading", False)
@@ -320,6 +452,8 @@ def main(demo=False):
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_RUN_FREQ)
+  last_model_output: dict[str, np.ndarray] | None = None  # newest REAL prediction, for lowfreq.age
+  last_execution_time = 0.0  # newest REAL model time; aged frames report this, not the age() cost
   frame_id = 0
   last_vipc_frame_id = 0
   run_count = 0
@@ -339,7 +473,7 @@ def main(demo=False):
 
   # TODO this needs more thought, use .2s extra for now to estimate other delays
   # TODO Move smooth seconds to action function
-  long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS
+  long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS + (PIPELINE_DELAY if lc_active() else 0.0)
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
@@ -382,7 +516,10 @@ def main(demo=False):
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["narrowRoadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
-    lat_delay = sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+    # + PIPELINE_DELAY: at 5 Hz the freshest result has already been in flight a full RUN_EVERY*DT_MDL
+    # before we can publish it. Carrying it in the actuator delay (rather than in frame_delay) keeps it
+    # OUT of the age -- the prediction at age 0 really is age 0, the lookahead window just grows by 0.2 s.
+    lat_delay = sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS + (PIPELINE_DELAY if lc_active() else 0.0)
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
@@ -412,6 +549,10 @@ def main(demo=False):
 
     bufs = {name: buf_extra if 'big' in name else buf_main for name in model.vision_input_names}
     transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
+    # `prediction_age` is time since the last COLLECT (0, 50, 100, 150 ms) and is what the plan is aged
+    # by. The constant RUN_EVERY*DT_MDL the result spent in flight goes into lat/long delay instead --
+    # counting it in BOTH would give a lookahead of lat_delay + 2*PIPELINE_DELAY.
+    prediction_age = (run_count % RUN_EVERY) * DT_MDL if lc_active() else 0.0
     frame_delay = DT_MDL # compensate for time passed since the frame was captured: current_time - timestamp_eof is 50ms on average
     action_delay = DT_MDL / 2 # middle of the interval between model output (current state) and next frame (expected state)
     lat_action_t = lat_delay + frame_delay + action_delay
@@ -423,9 +564,22 @@ def main(demo=False):
     }
 
     mt1 = time.perf_counter()
-    try:
+    if isinstance(model, CinqueModelState):
+      # ★ warp EVERY frame (it ticks the 20 Hz queues), but run the tower only every RUN_EVERY.
+      # Collect BEFORE dispatching: `outs` is single-buffered, so dispatching first would overwrite the
+      # result still being awaited.
+      model.warp_frame(bufs, transforms, vec_desire)
+      if run_count % RUN_EVERY == 0:
+        fresh = model.collect()
+        if fresh is not None:
+          last_model_output, last_execution_time = fresh, time.perf_counter() - mt1
+        model.run(inputs, defer=True)
+      model_output = (lowfreq.age(last_model_output, prediction_age)
+                      if last_model_output is not None else None)
+    else:
+     try:
       model_output = model.run(bufs, transforms, inputs)
-    except Exception:
+     except Exception:
       if not params.get_bool("UsbGpuActive"):
         raise
       # fallback to small model
@@ -437,7 +591,9 @@ def main(demo=False):
       run_count = 0
       model_output = None
     mt2 = time.perf_counter()
-    model_execution_time = mt2 - mt1
+    # an aged frame did no model work; reporting the age() cost as execution time would make the
+    # 20 Hz log look like a 0.3 ms model. Report the newest REAL run instead.
+    model_execution_time = last_execution_time if isinstance(model, CinqueModelState) else mt2 - mt1
 
     if model_output is not None:
       modelv2_send = messaging.new_message('modelV2')
