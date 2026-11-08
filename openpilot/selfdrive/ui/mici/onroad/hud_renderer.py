@@ -3,6 +3,7 @@ import raylib_nb as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
 from openpilot.selfdrive.ui.mici.onroad.torque_bar import TorqueBar
+from openpilot.selfdrive.ui.onroad.blind_spot_bars import BlindSpotBars
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus, ChestnutState
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
@@ -116,6 +117,7 @@ class HudRenderer(Widget):
     self._font_medium: rl.Font = gui_app.font(FontWeight.MEDIUM)
     self._font_semi_bold: rl.Font = gui_app.font(FontWeight.SEMI_BOLD)
     self._font_display: rl.Font = gui_app.font(FontWeight.DISPLAY)
+    self._blind_spot_bars = BlindSpotBars()
 
     self._turn_intent = TurnIntent()
     self._torque_bar = TorqueBar()
@@ -148,6 +150,7 @@ class HudRenderer(Widget):
   def _update_state(self) -> None:
     """Update HUD state based on car state and controls state."""
     sm = ui_state.sm
+    self._blind_spot_bars.update()
     if sm.recv_frame["carState"] < ui_state.started_frame:
       self.is_cruise_set = False
       self.set_speed = SET_SPEED_NA
@@ -175,6 +178,7 @@ class HudRenderer(Widget):
 
   def _render(self, rect: rl.Rectangle) -> None:
     """Render HUD elements to the screen."""
+    self._blind_spot_bars.render(rect)
 
     self._torque_bar.render(rect)
 

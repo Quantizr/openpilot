@@ -25,6 +25,11 @@ DESCRIPTIONS = {
     "Receive alerts to steer back into the lane when your vehicle drifts over a detected lane line " +
     "without a turn signal activated while driving over 31 mph (50 km/h)."
   ),
+  "BlindSpotAssist": tr_noop(
+    "Use the cabin camera to try to spot cars in your blind spots. Detections show as bars on the sides of the screen and " +
+    "block openpilot lane changes towards that side. This is not blind spot monitoring and must not be relied upon. " +
+    "Always check your mirrors and blind spots yourself."
+  ),
   "AlwaysOnDM": tr_noop("Enable driver monitoring even when openpilot is not engaged."),
   'RecordFront': tr_noop("Upload data from the cabin camera and help improve the driver monitoring algorithm."),
   "IsMetric": tr_noop("Display speed in km/h instead of mph."),
@@ -54,6 +59,12 @@ class TogglesLayout(Widget):
       "IsLdwEnabled": (
         lambda: tr("Enable Lane Departure Warnings"),
         DESCRIPTIONS["IsLdwEnabled"],
+        "warning.png",
+        False,
+      ),
+      "BlindSpotAssist": (
+        lambda: tr("Blind Spot Assist"),
+        DESCRIPTIONS["BlindSpotAssist"],
         "warning.png",
         False,
       ),

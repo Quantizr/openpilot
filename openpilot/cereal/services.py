@@ -69,6 +69,7 @@ _services: dict[str, tuple] = {
   "cabinEncodeIdx": (False, 20., 1),
   "driverStateV2": (True, 20., 10),
   "driverMonitoringState": (True, 20., 10),
+  "blindSpotAssist": (True, 5., 1),
   "wideRoadEncodeIdx": (False, 20., 1),
   "wideRoadCameraState": (True, 20., 20),
   "drivingModelData": (True, 20., 10),

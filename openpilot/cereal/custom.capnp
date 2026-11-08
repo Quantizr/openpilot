@@ -10,7 +10,19 @@ $Cxx.namespace("cereal");
 # DO rename the structs
 # DON'T change the identifier (e.g. @0x81c2f05a394cf4af)
 
-struct CustomReserved0 @0x81c2f05a394cf4af {
+struct BlindSpotAssist @0x81c2f05a394cf4af {
+  frameId @0 :UInt32;
+  leftProb @1 :Float32;
+  rightProb @2 :Float32;
+  leftLevel @3 :Float32;
+  rightLevel @4 :Float32;
+  leftDetected @5 :Bool;
+  rightDetected @6 :Bool;
+  modelExecutionTime @7 :Float32;
+  leftAdjacentProb @8 :Float32;
+  rightAdjacentProb @9 :Float32;
+  leftApproachingProb @10 :Float32;
+  rightApproachingProb @11 :Float32;
 }
 
 struct CustomReserved1 @0xaedffd8f31e7b55d {

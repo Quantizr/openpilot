@@ -17,6 +17,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.gps import get_gps_location_service
 
 from openpilot.selfdrive.car.car_events import CarEvents
+from openpilot.selfdrive.controls.lib.desire_helper import bsa_blindspots
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.selfdrived.events import Events, ET
 from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
@@ -82,7 +83,8 @@ class SelfdriveD:
     # TODO: de-couple selfdrived with card/conflate on carState without introducing controls mismatches
     self.car_state_sock = messaging.sub_sock('carState', timeout=20)
 
-    ignore = self.sensor_packets + self.gps_packets + ['alertDebug', 'lateralManeuverPlan']
+    # blindSpotAssist only runs while its toggle is on
+    ignore = self.sensor_packets + self.gps_packets + ['alertDebug', 'lateralManeuverPlan', 'blindSpotAssist']
     if SIMULATION:
       ignore += ['cabinCameraState', 'managerState']
     if REPLAY:
@@ -92,7 +94,7 @@ class SelfdriveD:
                                    'carOutput', 'driverMonitoringState', 'longitudinalPlan', 'deviceMotion', 'lateralDelay',
                                    'managerState', 'vehicleParameters', 'radarState', 'lateralTorqueParameters',
                                    'controlsState', 'carControl', 'driverAssistance', 'alertDebug', 'userBookmark',
-                                   'lateralManeuverPlan'] + \
+                                   'lateralManeuverPlan', 'blindSpotAssist'] + \
                                    self.camera_packets + self.sensor_packets + self.gps_packets,
                                   ignore_alive=ignore, ignore_avg_freq=ignore,
                                   ignore_valid=ignore, frequency=int(1/DT_CTRL))
@@ -318,8 +320,9 @@ class SelfdriveD:
     # Handle lane change
     if self.sm['modelV2'].meta.laneChangeState == LaneChangeState.preLaneChange:
       direction = self.sm['modelV2'].meta.laneChangeDirection
-      if (CS.leftBlindspot and direction == LaneChangeDirection.left) or \
-         (CS.rightBlindspot and direction == LaneChangeDirection.right):
+      bsa_left, bsa_right = bsa_blindspots(self.sm)
+      if ((CS.leftBlindspot or bsa_left) and direction == LaneChangeDirection.left) or \
+         ((CS.rightBlindspot or bsa_right) and direction == LaneChangeDirection.right):
         self.events.add(EventName.laneChangeBlocked)
       else:
         if direction == LaneChangeDirection.left:

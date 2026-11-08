@@ -9,6 +9,12 @@ LANE_CHANGE_SPEED_MIN = 20 * CV.MPH_TO_MS
 LANE_CHANGE_TIME_MAX = 10.
 LANE_CHANGE_START_TIME = 0.5
 
+
+def bsa_blindspots(sm) -> tuple[bool, bool]:
+  """Blind Spot Assist (blindspotmodeld) left / right detections; False when it isn't running (toggle off)"""
+  bsa = sm['blindSpotAssist']
+  return (bsa.leftDetected, bsa.rightDetected) if sm.alive['blindSpotAssist'] and sm.valid['blindSpotAssist'] else (False, False)
+
 class DesireHelper:
   def __init__(self):
     self.lane_change_state = LaneChangeState.off
@@ -21,7 +27,7 @@ class DesireHelper:
   def get_lane_change_direction(CS):
     return LaneChangeDirection.left if CS.leftBlinker else LaneChangeDirection.right
 
-  def update(self, carstate, lateral_active, lane_change_prob):
+  def update(self, carstate, lateral_active, lane_change_prob, bsa_left=False, bsa_right=False):
     v_ego = carstate.vEgo
     one_blinker = carstate.leftBlinker != carstate.rightBlinker
     below_lane_change_speed = v_ego < LANE_CHANGE_SPEED_MIN
@@ -45,8 +51,8 @@ class DesireHelper:
                          ((carstate.steeringTorque > 0 and self.lane_change_direction == LaneChangeDirection.left) or
                           (carstate.steeringTorque < 0 and self.lane_change_direction == LaneChangeDirection.right))
 
-        blindspot_detected = ((carstate.leftBlindspot and self.lane_change_direction == LaneChangeDirection.left) or
-                              (carstate.rightBlindspot and self.lane_change_direction == LaneChangeDirection.right))
+        blindspot_detected = (((carstate.leftBlindspot or bsa_left) and self.lane_change_direction == LaneChangeDirection.left) or
+                              ((carstate.rightBlindspot or bsa_right) and self.lane_change_direction == LaneChangeDirection.right))
 
         if not one_blinker or below_lane_change_speed:
           self.lane_change_state = LaneChangeState.off

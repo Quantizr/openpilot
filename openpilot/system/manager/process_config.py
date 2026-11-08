@@ -61,6 +61,9 @@ def navigation(started: bool, params: Params, CP: car.CarParams) -> bool:
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
+def blind_spot_assist(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and params.get_bool("BlindSpotAssist")
+
 def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("IsLiveStreaming")
 
@@ -89,6 +92,7 @@ procs = [
   PythonProcess("navd", "openpilot.selfdrive.navigation.navd", navigation),
   PythonProcess("mapsd", "openpilot.selfdrive.navigation.mapsd", navigation),
   PythonProcess("dmonitoringmodeld", "openpilot.selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
+  PythonProcess("blindspotmodeld", "openpilot.selfdrive.modeld.blindspotmodeld", blind_spot_assist),
 
   PythonProcess("sensord", "openpilot.system.sensord.sensord", only_onroad, enabled=not PC),
   PythonProcess("ui", "openpilot.selfdrive.ui.ui", always_run),
